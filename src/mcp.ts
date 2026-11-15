@@ -162,7 +162,10 @@ export async function delegate(deps: McpDeps, args: Json, signal?: AbortSignal):
   const nextDepth = depth + 1
   const timeout = AbortSignal.timeout(deps.timeoutMs ?? DEFAULT_TIMEOUT_MS)
   const label = `${host === 'antigravity' ? 'agy' : host}:${agent}${model ? ` · ${model}` : ''}${effort ? `@${effort}` : ''}`
-  const done = deps.activity ? await deps.activity(label) : async () => {}
+  // Everything that can throw runs before the record exists, so a failure never leaves a ghost in the bar.
+  const permission = await deps.permission()
+  const noop = async () => {}
+  const done = deps.activity ? await deps.activity(label).catch(() => noop) : noop
   const res = await runTurn(
     deps.dispatch,
     {
@@ -171,7 +174,7 @@ export async function delegate(deps: McpDeps, args: Json, signal?: AbortSignal):
       agent,
       model,
       effort,
-      permission: await deps.permission(),
+      permission,
       cwd: confined.cwd,
       env: { ...env, [DEPTH_ENV]: String(nextDepth), [CALLER_ENV]: host },
       // Defense in depth at the last level: claude also gets the delegate tool denied outright. agy

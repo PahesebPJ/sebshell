@@ -324,13 +324,19 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         bar.update({ busy: true, activeSubagents: [label] })
         // Delegations run by the host's own `sebshell mcp` live in other processes: poll their registry.
         let polling = false
+        let turnActive = true
+        let shown = ''
         const poll = deps.activity
           ? setInterval(() => {
               if (polling) return
               polling = true
               deps.activity!(shellSession)
                 .then((mcp) => {
-                  if (inflight) bar.update({ activeSubagents: [label, ...mcp] })
+                  const subs = [label, ...mcp]
+                  const key = subs.join('\n')
+                  if (!turnActive || key === shown) return
+                  shown = key
+                  bar.update({ activeSubagents: subs })
                 })
                 .catch(() => {})
                 .finally(() => {
@@ -354,6 +360,7 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
           inflight.signal,
         ).finally(() => {
           inflight = null
+          turnActive = false
           if (poll) clearInterval(poll)
         })
         if (res.context) {

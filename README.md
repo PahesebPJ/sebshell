@@ -63,7 +63,7 @@ Salvaguardas:
 - Las variables de entorno con aspecto de secreto se eliminan.
 - Nunca se cambia de cuenta si el perfil falla.
 
-Las delegaciones que lanza el host por MCP aparecen en la barra inferior de la sesión de sebshell que lo inició (`sub N (...)`). Cada proceso del host recibe `SEBSHELL_SESSION_ID`, y `sebshell mcp` registra cada turno activo en `$XDG_RUNTIME_DIR/sebshell/active/` (o en `~/.local/state/sebshell/active/`).
+Las delegaciones que lanza el host por MCP aparecen en la barra inferior de la sesión de sebshell que lo inició (`sub N (...)`). Cada proceso del host recibe `SEBSHELL_SESSION_ID`, y `sebshell mcp` registra cada turno activo en `~/.local/state/sebshell/active/` (directorio `0700` propio; registros `0600`, que se purgan si el proceso murió o tienen más de 24 h).
 
 El modo de permisos de los turnos delegados se elige en el asistente: `default` (no pueden editar archivos sin aprobación) o `accept-edits`.
 
