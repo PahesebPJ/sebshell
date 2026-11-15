@@ -272,6 +272,8 @@ describe('shell line parser', () => {
     assert.deepEqual(parseShellLine(':h nope'), { kind: 'host', host: null, raw: 'nope' })
     assert.deepEqual(parseShellLine(':agent researcher'), { kind: 'agent', agent: 'researcher' })
     assert.deepEqual(parseShellLine(':agent none'), { kind: 'agent', agent: null })
+    assert.deepEqual(parseShellLine(':profile trabajo'), { kind: 'profile', name: 'trabajo' })
+    assert.deepEqual(parseShellLine(':p'), { kind: 'profile', name: null })
     assert.equal(parseShellLine(':q').kind, 'exit')
     assert.equal(parseShellLine('').kind, 'empty')
     assert.equal(parseShellLine(':wat').kind, 'unknown')

@@ -15,6 +15,8 @@ import {
 import { type DispatchDeps, runTurn } from '../dispatch.ts'
 import { type ExecOptions, execCancellable } from '../process.ts'
 import { type InstallerDeps, runInstall, type StepReport } from '../installer.ts'
+import { PROFILE_USAGE, parseHost, resolveProfile, runProfileCli } from '../profile-cli.ts'
+import { activeProfileName, listProfiles, loadProfiles, type Profile, profileEnv, syncProfiles } from '../profiles.ts'
 import { runShell } from '../shell.ts'
 import { installTerminalRestore, supportsTruecolor } from '../tui/ansi.ts'
 import { renderBanner } from '../tui/banner.ts'
@@ -82,7 +84,11 @@ async function install(runtime: SystemRuntime, config: ShellConfig, dryRun: bool
     dryRun,
     onStep: quiet ? undefined : (r, i, t) => printStep(r, i, t, color, config),
   })
-  if (!dryRun && reports.every((r) => r.status !== 'failed')) await registerNode(runtime)
+  if (!dryRun) {
+    // Profiles share ~/.claude assets via symlinks; sync picks up MCP servers that setup just added.
+    await syncProfiles(runtime)
+    if (reports.every((r) => r.status !== 'failed')) await registerNode(runtime)
+  }
   return reports
 }
 
@@ -134,7 +140,8 @@ Uso:
   sebshell                         Abre la shell (asistente en el primer arranque)
   sebshell config                  Reabre el asistente de configuración
   sebshell install [--dry-run]     Instala/configura las herramientas elegidas
-  sebshell run --host claude|agy [--agent <rol>] "<prompt>"
+  sebshell run --host claude|agy [--agent <rol>] [--profile <nombre>] "<prompt>"
+  sebshell profile <list|add|login|use|rm|sync>   Cuentas por host (ver: sebshell profile help)
   sebshell doctor [--json]         Estado de hosts, nodos hubseb y configuración
   sebshell capabilities [--json]
 `
@@ -188,18 +195,42 @@ export async function main(argv: string[]): Promise<number> {
     return failed ? 1 : 0
   }
 
+  if (action === 'profile' || action === 'profiles') {
+    const sub = args.slice(1)
+    if (sub[0] === 'help' || sub[0] === '--help') {
+      process.stdout.write(PROFILE_USAGE)
+      return 0
+    }
+    return runProfileCli(runtime, sub, jsonMode)
+  }
+
   if (action === 'run') {
     const rest = args.slice(1)
     const hostArg = readFlag(rest, '--host') ?? config?.orchestrator ?? 'claude'
     const agent = readFlag(rest, '--agent') ?? null
-    const host: ShellHost | undefined = hostArg === 'agy' ? 'antigravity' : SHELL_HOSTS.find((h) => h === hostArg)
+    const profileName = readFlag(rest, '--profile') ?? null
+    const host = parseHost(hostArg)
     const prompt = rest.join(' ').trim()
     if (!host || !prompt) {
       const msg = !host ? `Host inválido "${hostArg}"` : 'Falta el prompt'
       process.stderr.write(jsonMode ? serializeWire(wireFailure('run', 'bad_args', msg)) : `${msg}\n${USAGE}`)
       return 2
     }
-    const res = await runTurn(makeDeps(runtime), { host, agent, prompt, contextWindow: config?.contextWindow[host] })
+    let profile: Profile
+    try {
+      profile = await resolveProfile(runtime, host, profileName)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      process.stderr.write(jsonMode ? serializeWire(wireFailure('run', 'profile_error', msg)) : `${msg}\n`)
+      return 2
+    }
+    const res = await runTurn(makeDeps(runtime), {
+      host,
+      agent,
+      prompt,
+      env: profileEnv(profile),
+      contextWindow: config?.contextWindow[host],
+    })
     if (jsonMode) {
       process.stdout.write(serializeWire(res.ok ? wireSuccess('run', res) : wireFailure('run', 'host_error', res.error ?? 'error')))
     } else {
@@ -251,6 +282,11 @@ export async function main(argv: string[]): Promise<number> {
         ]
       },
       reconfigure: () => interactiveWizard(runtime, effective),
+      profiles: {
+        active: async (host) => activeProfileName(await loadProfiles(runtime), host),
+        names: async (host) => listProfiles(await loadProfiles(runtime), host).map((p) => p.name),
+        env: async (host, name) => profileEnv(await resolveProfile(runtime, host, name)),
+      },
     },
     VERSION,
   )

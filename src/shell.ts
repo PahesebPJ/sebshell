@@ -16,12 +16,18 @@ export interface ShellServices {
   dispatch: DispatchDeps
   services(): Promise<{ id: string; healthy: boolean }[]>
   reconfigure(): Promise<ShellConfig | null>
+  profiles: {
+    active(host: ShellHost): Promise<string>
+    names(host: ShellHost): Promise<string[]>
+    env(host: ShellHost, name: string): Promise<NodeJS.ProcessEnv>
+  }
 }
 
 export type ShellCommand =
   | { kind: 'prompt'; text: string }
   | { kind: 'host'; host: ShellHost | null; raw: string }
   | { kind: 'agent'; agent: string | null }
+  | { kind: 'profile'; name: string | null }
   | { kind: 'new' }
   | { kind: 'config' }
   | { kind: 'help' }
@@ -50,6 +56,9 @@ export function parseShellLine(line: string): ShellCommand {
     case 'agent':
     case 'a':
       return { kind: 'agent', agent: arg && arg !== 'none' && arg !== '-' ? arg : null }
+    case 'profile':
+    case 'p':
+      return { kind: 'profile', name: arg || null }
     case 'new':
     case 'reset':
       return { kind: 'new' }
@@ -71,6 +80,7 @@ const HELP = [
   'Escribe un prompt y se envía al host activo. Comandos:',
   '  :host claude|agy     cambia el orquestador activo',
   '  :agent <rol>|none    usa un subagente de crewseb (developer, researcher, …)',
+  '  :profile [nombre]    lista o cambia la cuenta del host activo (sebshell profile add …)',
   '  :new                 inicia una conversación nueva en el host activo',
   '  :config              reabre el asistente de configuración',
   '  :help  ·  :exit',
@@ -80,16 +90,31 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
   let config = initial
   let theme = getTheme(config.theme)
   let p = createPainter(io.color)
-  const sessions: Partial<Record<ShellHost, string>> = {}
-  const contexts: Partial<Record<ShellHost, ContextSnapshot>> = {}
+  // Keyed by host/profile: a conversation belongs to the account that started it.
+  const sessions: Record<string, string> = {}
+  const contexts: Record<string, ContextSnapshot> = {}
   let host: ShellHost = config.orchestrator
   let agent: string | null = null
+  const profiles: Partial<Record<ShellHost, string>> = {}
+  for (const h of config.hosts) {
+    try {
+      profiles[h] = await deps.profiles.active(h)
+    } catch {
+      profiles[h] = 'default'
+    }
+  }
+  const sessionKey = () => `${host}/${profiles[host] ?? 'default'}`
+
+  const profileLabel = () => {
+    const name = profiles[host]
+    return name && name !== 'default' ? name : null
+  }
 
   const model = (): StatusModel => ({
     orchestrator: host,
-    profile: null,
+    profile: profileLabel(),
     agent,
-    context: contexts[host] ?? null,
+    context: contexts[sessionKey()] ?? null,
     activeSubagents: [],
     services: [],
     busy: false,
@@ -204,7 +229,7 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
           return
         }
         host = cmd.host
-        bar.update({ orchestrator: host, context: contexts[host] ?? null })
+        bar.update({ orchestrator: host, context: contexts[sessionKey()] ?? null })
         return
       case 'agent':
         if (cmd.agent && !isValidAgentName(cmd.agent)) {
@@ -214,9 +239,24 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         agent = cmd.agent
         bar.update({ agent })
         return
+      case 'profile': {
+        const names = await deps.profiles.names(host)
+        if (!cmd.name) {
+          out.write(`Perfiles de ${host}: ${names.map((n) => (n === (profiles[host] ?? 'default') ? `[${n}]` : n)).join(' ')}\n`)
+          return
+        }
+        if (!names.includes(cmd.name)) {
+          out.write(p.fg(theme.warn, `No existe el perfil ${host}/${cmd.name}. Créalo con: sebshell profile add ${host} ${cmd.name}\n`))
+          return
+        }
+        profiles[host] = cmd.name
+        bar.update({ profile: profileLabel(), context: contexts[sessionKey()] ?? null })
+        out.write(p.fg(theme.muted, `${host} ahora usa el perfil ${cmd.name} (solo en esta sesión; para fijarlo: sebshell profile use).\n`))
+        return
+      }
       case 'new':
-        delete sessions[host]
-        delete contexts[host]
+        delete sessions[sessionKey()]
+        delete contexts[sessionKey()]
         bar.update({ context: null })
         out.write(p.fg(theme.muted, `Nueva conversación en ${host}.\n`))
         return
@@ -230,7 +270,8 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
             host,
             prompt: cmd.text,
             agent,
-            sessionId: sessions[host] ?? null,
+            sessionId: sessions[sessionKey()] ?? null,
+            env: await deps.profiles.env(host, profiles[host] ?? 'default').catch(() => ({})),
             contextWindow: config.contextWindow[host],
           },
           inflight.signal,
@@ -238,11 +279,11 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
           inflight = null
         })
         if (res.context) {
-          contexts[host] = res.context
-          if (res.context.sessionId) sessions[host] = res.context.sessionId
+          contexts[sessionKey()] = res.context
+          if (res.context.sessionId) sessions[sessionKey()] = res.context.sessionId
         }
         out.write(res.ok ? `${res.text.trimEnd()}\n` : p.fg(theme.danger, `✖ ${res.error}\n`))
-        bar.update({ busy: false, activeSubagents: [], context: contexts[host] ?? null })
+        bar.update({ busy: false, activeSubagents: [], context: contexts[sessionKey()] ?? null })
         return
       }
     }
