@@ -199,6 +199,7 @@ describe('wizard', () => {
       { id: 'components', res: { kind: 'submitted', values: ['memoseb', 'crewseb'] } },
       { id: 'orchestrator', res: { kind: 'submitted', values: ['antigravity'] } },
       { id: 'modelPreset', res: { kind: 'submitted', values: ['cloud-tiered'] } },
+      { id: 'delegatePermission', res: { kind: 'submitted', values: ['accept-edits'] } },
       { id: 'theme', res: { kind: 'submitted', values: ['ember'] } },
       { id: 'confirm', res: { kind: 'submitted', values: ['save'] } },
     ]
@@ -209,10 +210,12 @@ describe('wizard', () => {
       assert.equal(q.id, next?.id)
       return next!.res
     }, ['claude'])
-    assert.equal(seen.length, 8)
+    assert.equal(seen.length, 9)
     assert.equal(outcome.kind, 'apply')
     if (outcome.kind !== 'apply') return
     assert.equal(outcome.install, false)
+    assert.equal(outcome.editCrew, false)
+    assert.equal(outcome.config.delegatePermission, 'accept-edits')
     assert.deepEqual(outcome.config.hosts, ['claude', 'antigravity'])
     assert.equal(outcome.config.orchestrator, 'antigravity')
     assert.equal(outcome.config.modelPreset, 'cloud-tiered')

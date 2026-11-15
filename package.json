@@ -1,6 +1,6 @@
 {
   "name": "sebshell",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Unified installer, mixed-host agent shell and account profiles for the *seb ecosystem (Claude Code + Antigravity CLI).",
   "license": "MIT",
   "author": "PahesebPJ",
@@ -22,7 +22,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node -e \"fs.chmodSync('dist/bin/sebshell.js', 0o755)\"",

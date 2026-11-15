@@ -22,6 +22,9 @@ export type ThemeName = (typeof THEMES)[number]
 export const MODEL_PRESETS = ['default', 'lite', 'hard', 'hybrid', 'cloud-tiered'] as const
 export type ModelPreset = (typeof MODEL_PRESETS)[number]
 
+export const DELEGATE_PERMISSIONS = ['default', 'accept-edits'] as const
+export type DelegatePermission = (typeof DELEGATE_PERMISSIONS)[number]
+
 export interface ShellConfig {
   schema: 'sebshell-config/v1'
   hosts: ShellHost[]
@@ -29,6 +32,11 @@ export interface ShellConfig {
   orchestrator: ShellHost
   modelPreset: ModelPreset
   theme: ThemeName
+  /**
+   * Permission mode for headless delegated turns. 'default' cannot approve tool prompts (edits
+   * are denied); 'accept-edits' lets delegated specialists edit files in the working directory.
+   */
+  delegatePermission: DelegatePermission
   /** Overrides for context window sizes keyed by host; used when the host does not report it. */
   contextWindow: Partial<Record<ShellHost, number>>
   configuredAt: string
@@ -42,6 +50,7 @@ export function defaultConfig(): ShellConfig {
     orchestrator: 'claude',
     modelPreset: 'hybrid',
     theme: 'aurora',
+    delegatePermission: 'default',
     contextWindow: {},
     configuredAt: new Date().toISOString(),
   }
@@ -82,6 +91,7 @@ export function normalizeConfig(raw: unknown): ShellConfig {
     orchestrator: hosts.includes(orchestrator) ? orchestrator : (hosts[0] ?? 'claude'),
     modelPreset: oneOf(r.modelPreset, MODEL_PRESETS, base.modelPreset),
     theme: oneOf(r.theme, THEMES, base.theme),
+    delegatePermission: oneOf(r.delegatePermission, DELEGATE_PERMISSIONS, base.delegatePermission),
     contextWindow,
     configuredAt: typeof r.configuredAt === 'string' ? r.configuredAt : base.configuredAt,
   }
