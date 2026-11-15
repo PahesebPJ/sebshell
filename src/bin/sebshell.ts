@@ -2,6 +2,7 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { DriverHub, serializeWire, SystemRuntime, TopologyStore, wireFailure, wireSuccess } from 'hubseb'
+import { activityDir, beginActivity, isSessionId, listActivity, SESSION_ENV } from '../activity.ts'
 import {
   type ComponentId,
   configFile,
@@ -286,6 +287,10 @@ export async function main(argv: string[]): Promise<number> {
         enabledHosts: async () => ((await loadConfig(runtime)) ?? defaultConfig()).hosts,
         env: process.env,
         cwd: process.cwd(),
+        activity: async (label) => {
+          const session = process.env[SESSION_ENV]
+          return isSessionId(session) ? beginActivity(activityDir(), session, label) : async () => {}
+        },
       },
       VERSION,
       process.stdin,
@@ -416,6 +421,7 @@ export async function main(argv: string[]): Promise<number> {
         ]
       },
       reconfigure: () => interactiveWizard(runtime, effective),
+      activity: (session) => listActivity(activityDir(), session),
       ...(runtime.locateBinary('crewseb') ? { crew: makeCrew(runtime), editCrew: () => editCrewInteractive(runtime, effective) } : {}),
       profiles: {
         active: async (host) => activeProfileName(await loadProfiles(runtime), host),
