@@ -8,6 +8,11 @@ export interface TurnRequest {
   host: ShellHost
   prompt: string
   agent?: string | null
+  /** Concrete model for this turn (e.g. gemini-4-hydrogen); omitted = the host/agent default. */
+  model?: string | null
+  effort?: EffortLevel | null
+  /** 'accept-edits' lets a headless turn edit files without an interactive approval prompt. */
+  permission?: PermissionMode
   sessionId?: string | null
   cwd?: string
   /** Extra env for the host process (e.g. CLAUDE_CONFIG_DIR of an account profile). */
@@ -23,9 +28,38 @@ export interface Invocation {
 }
 
 const AGENT_NAME = /^[A-Za-z0-9][\w.-]{0,63}$/
+const MODEL_NAME = /^[A-Za-z0-9][\w.:/-]{0,95}$/
+
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type EffortLevel = (typeof EFFORT_LEVELS)[number]
+export type PermissionMode = 'default' | 'accept-edits'
+
+export function isEffortLevel(v: unknown): v is EffortLevel {
+  return typeof v === 'string' && (EFFORT_LEVELS as readonly string[]).includes(v)
+}
 
 export function isValidAgentName(name: string): boolean {
   return AGENT_NAME.test(name)
+}
+
+export function isValidModelName(name: string): boolean {
+  return MODEL_NAME.test(name)
+}
+
+const EFFORT_SUFFIX = new RegExp(`^(.+)-(${EFFORT_LEVELS.join('|')})$`)
+
+/**
+ * agy rejects `--model <id-with-effort-suffix> --effort <other>`; when both are given the
+ * suffix is dropped so the explicit effort wins.
+ */
+export function agyModelArgs(model: string | null | undefined, effort: EffortLevel | null | undefined): string[] {
+  const args: string[] = []
+  if (model) {
+    const m = EFFORT_SUFFIX.exec(model)
+    args.push('--model', effort && m ? (m[1] as string) : model)
+  }
+  if (effort) args.push('--effort', effort)
+  return args
 }
 
 export interface TurnResult {
@@ -44,8 +78,18 @@ export function hostBinary(host: ShellHost): string {
 export function buildInvocation(req: TurnRequest): Invocation {
   if (req.agent && !isValidAgentName(req.agent)) throw new Error(`Nombre de agente inválido "${req.agent}"`)
   if (req.sessionId && !isValidAgentName(req.sessionId)) throw new Error('ID de sesión inválido')
+  if (req.model && !isValidModelName(req.model)) throw new Error(`Nombre de modelo inválido "${req.model}"`)
+  if (req.effort && !isEffortLevel(req.effort)) throw new Error(`Esfuerzo inválido "${String(req.effort)}"`)
   const flags = ['--output-format', 'json']
   if (req.agent) flags.push('--agent', req.agent)
+  if (req.host === 'claude') {
+    if (req.model) flags.push('--model', req.model)
+    if (req.effort) flags.push('--effort', req.effort)
+    if (req.permission === 'accept-edits') flags.push('--permission-mode', 'acceptEdits')
+  } else {
+    flags.push(...agyModelArgs(req.model, req.effort))
+    if (req.permission === 'accept-edits') flags.push('--mode', 'accept-edits')
+  }
   if (req.sessionId) flags.push(req.host === 'claude' ? '--resume' : '--conversation', req.sessionId)
   // claude's -p is boolean and reads the prompt from stdin; agy's -p takes the next argv verbatim as its value.
   if (req.host === 'claude') return { bin: HOST_BIN.claude, args: ['-p', ...flags], input: req.prompt }

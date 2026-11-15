@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline'
 import { SHELL_HOSTS, type ShellConfig, type ShellHost } from './config.ts'
+import { type CrewClient, hostFor, invocationFor, isCrewRole } from './crew.ts'
 import { type DispatchDeps, isValidAgentName, runTurn } from './dispatch.ts'
 import { renderBanner } from './tui/banner.ts'
 import { StatusBar, type StatusModel } from './tui/statusbar.ts'
@@ -16,6 +17,9 @@ export interface ShellServices {
   dispatch: DispatchDeps
   services(): Promise<{ id: string; healthy: boolean }[]>
   reconfigure(): Promise<ShellConfig | null>
+  /** crewseb integration (routing + per-role model/effort); absent when crewseb is not installed. */
+  crew?: CrewClient
+  editCrew?(): Promise<void>
   profiles: {
     active(host: ShellHost): Promise<string>
     names(host: ShellHost): Promise<string[]>
@@ -30,6 +34,7 @@ export type ShellCommand =
   | { kind: 'profile'; name: string | null }
   | { kind: 'new' }
   | { kind: 'config' }
+  | { kind: 'crew' }
   | { kind: 'help' }
   | { kind: 'exit' }
   | { kind: 'empty' }
@@ -64,6 +69,8 @@ export function parseShellLine(line: string): ShellCommand {
       return { kind: 'new' }
     case 'config':
       return { kind: 'config' }
+    case 'crew':
+      return { kind: 'crew' }
     case 'help':
     case '?':
       return { kind: 'help' }
@@ -83,6 +90,7 @@ const HELP = [
   '  :profile [nombre]    lista o cambia la cuenta del host activo (sebshell profile add …)',
   '  :new                 inicia una conversación nueva en el host activo',
   '  :config              reabre el asistente de configuración',
+  '  :crew                edita host, modelo y esfuerzo de cada subagente',
   '  :help  ·  :exit',
 ].join('\n')
 
@@ -107,7 +115,9 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
   await refreshProfile(host).catch((e: unknown) => {
     out.write(`⚠ ${e instanceof Error ? e.message : String(e)}\n`)
   })
-  const sessionKey = () => `${host}/${profiles[host] ?? 'default'}`
+  // A conversation belongs to a host, an account and the agent it was started with.
+  const keyFor = (h: ShellHost) => `${h}/${profiles[h] ?? 'default'}/${agent ?? 'main'}`
+  const sessionKey = () => keyFor(host)
 
   const profileLabel = () => {
     const name = profiles[host]
@@ -172,7 +182,7 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         running = false
         rl.close()
       })
-      let reconfigure = false
+      let reconfigure: 'config' | 'crew' | null = null
       rl.setPrompt(promptText())
       rl.prompt()
       for await (const line of rl) {
@@ -181,8 +191,13 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
           running = false
           break
         }
-        if (cmd.kind === 'config') {
-          reconfigure = true
+        if (cmd.kind === 'config' || cmd.kind === 'crew') {
+          if (cmd.kind === 'crew' && !deps.editCrew) {
+            out.write(p.fg(theme.warn, 'crewseb no está instalado; instálalo con sebshell install\n'))
+            rl.prompt()
+            continue
+          }
+          reconfigure = cmd.kind
           break
         }
         await handle(cmd)
@@ -194,7 +209,8 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
       if (!reconfigure) running = false
       else {
         bar.detach()
-        const next = await deps.reconfigure()
+        const next = reconfigure === 'config' ? await deps.reconfigure() : null
+        if (reconfigure === 'crew') await deps.editCrew?.()
         if (next) {
           config = next
           theme = getTheme(config.theme)
@@ -217,6 +233,7 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
       case 'empty':
       case 'exit':
       case 'config':
+      case 'crew':
         return
       case 'help':
         out.write(`${HELP}\n`)
@@ -268,30 +285,42 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         out.write(p.fg(theme.muted, `Nueva conversación en ${host}.\n`))
         return
       case 'prompt': {
+        // A crewseb role may be routed to another host and carry its own model/effort.
+        const info = agent && deps.crew && isCrewRole(agent) ? await deps.crew.role(agent).catch(() => undefined) : undefined
+        let turnHost = hostFor(info, host)
+        if (!config.hosts.includes(turnHost)) {
+          out.write(p.fg(theme.warn, `${agent} está ruteado a ${turnHost}, que no está habilitado; se ejecuta en ${host}.\n`))
+          turnHost = host
+        }
+        const { model: turnModel, effort: turnEffort } = invocationFor(info, turnHost)
+
         // Never fall back to another account: if the profile cannot be resolved, the turn is aborted.
         let env: NodeJS.ProcessEnv
         try {
-          const name = await refreshProfile(host)
-          env = await deps.profiles.env(host, name)
+          const name = await refreshProfile(turnHost)
+          env = await deps.profiles.env(turnHost, name)
         } catch (e) {
           out.write(p.fg(theme.danger, `✖ Perfil no disponible: ${e instanceof Error ? e.message : String(e)}\n`))
           bar.update({ profile: profileLabel() })
           return
         }
         bar.update({ profile: profileLabel(), context: contexts[sessionKey()] ?? null })
-        const label = `${host === 'antigravity' ? 'agy' : host}:${agent ?? 'main'}`
-        const turnKey = sessionKey()
+        const label = `${turnHost === 'antigravity' ? 'agy' : turnHost}:${agent ?? 'main'}${turnModel ? `·${turnModel}` : ''}${turnEffort ? `@${turnEffort}` : ''}`
+        if (turnHost !== host) out.write(p.fg(theme.muted, `↪ ${agent} se ejecuta en ${turnHost} (ruteo de crewseb)\n`))
+        const turnKey = keyFor(turnHost)
         bar.update({ busy: true, activeSubagents: [label] })
         inflight = new AbortController()
         const res = await runTurn(
           deps.dispatch,
           {
-            host,
+            host: turnHost,
             prompt: cmd.text,
             agent,
+            model: turnModel,
+            effort: turnEffort,
             sessionId: sessions[turnKey] ?? null,
             env,
-            contextWindow: config.contextWindow[host],
+            contextWindow: config.contextWindow[turnHost],
           },
           inflight.signal,
         ).finally(() => {

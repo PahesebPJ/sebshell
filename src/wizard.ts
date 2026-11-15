@@ -24,7 +24,7 @@ export interface WizardQuestion {
 export type Ask = (q: WizardQuestion, stepLabel: string) => Promise<MenuResult<string>>
 
 export type WizardOutcome =
-  | { kind: 'apply'; config: ShellConfig; install: boolean }
+  | { kind: 'apply'; config: ShellConfig; install: boolean; editCrew: boolean }
   | { kind: 'aborted' }
 
 const HOST_LABEL: Record<ShellHost, string> = {
@@ -88,6 +88,16 @@ export async function runWizard(
       initial: [draft.modelPreset],
     }),
     () => ({
+      id: 'delegatePermission',
+      title: 'Permisos de los subagentes que corren sin pantalla (delegados)',
+      mode: 'single',
+      options: [
+        { value: 'default', label: 'Pedir permiso (seguro)', hint: 'sin aprobación, no podrán editar archivos' },
+        { value: 'accept-edits', label: 'Aceptar ediciones', hint: 'editan archivos del proyecto sin preguntar' },
+      ],
+      initial: [draft.delegatePermission],
+    }),
+    () => ({
       id: 'theme',
       title: 'Tema de color',
       mode: 'single',
@@ -100,6 +110,7 @@ export async function runWizard(
       mode: 'single',
       options: [
         { value: 'install', label: 'Guardar e instalar ahora' },
+        { value: 'install-crew', label: 'Guardar, instalar y personalizar subagentes…', hint: 'host, modelo y esfuerzo por rol' },
         { value: 'save', label: 'Solo guardar configuración' },
       ],
       initial: ['install'],
@@ -131,12 +142,15 @@ export async function runWizard(
       case 'modelPreset':
         draft.modelPreset = values[0] as ModelPreset
         break
+      case 'delegatePermission':
+        draft.delegatePermission = values[0] === 'accept-edits' ? 'accept-edits' : 'default'
+        break
       case 'theme':
         draft.theme = values[0] as ThemeName
         break
       case 'confirm':
         draft.configuredAt = new Date().toISOString()
-        return { kind: 'apply', config: draft, install: values[0] === 'install' }
+        return { kind: 'apply', config: draft, install: values[0] !== 'save', editCrew: values[0] === 'install-crew' }
     }
     i++
   }

@@ -17,6 +17,9 @@ import { type ExecOptions, execCancellable } from '../process.ts'
 import { type InstallerDeps, runInstall, type StepReport } from '../installer.ts'
 import { PROFILE_USAGE, parseHost, resolveProfile, runProfileCli } from '../profile-cli.ts'
 import { activeProfileName, listProfiles, loadProfiles, type Profile, profileEnv, syncProfiles } from '../profiles.ts'
+import { runCrewEditor } from '../crew-editor.ts'
+import { CrewClient, hostFor, invocationFor, isCrewRole } from '../crew.ts'
+import { CALLER_ENV, serveMcp } from '../mcp.ts'
 import { runShell } from '../shell.ts'
 import { installTerminalRestore, supportsTruecolor } from '../tui/ansi.ts'
 import { renderBanner } from '../tui/banner.ts'
@@ -24,7 +27,7 @@ import { runMenu } from '../tui/menu.ts'
 import { createPainter, getTheme } from '../tui/theme.ts'
 import { runWizard } from '../wizard.ts'
 
-export const VERSION = '0.1.0'
+export const VERSION = '0.2.0'
 
 const NODE_ID = 'sebshell'
 const PROVIDES = ['seb.shell', 'seb.installer', 'seb.dispatch']
@@ -76,6 +79,55 @@ function printStep(report: StepReport, index: number, total: number, color: bool
   process.stdout.write(`${counter} ${icon} ${report.component.padEnd(19)} ${report.phase.padEnd(7)} ${p.fg(theme.muted, report.detail)}\n`)
 }
 
+function entryCommand(): string[] {
+  return [process.execPath, realpathSync(fileURLToPath(import.meta.url))]
+}
+
+/**
+ * Registers `sebshell mcp` as a user-scope MCP server in each enabled host, tagging the caller
+ * so seb_delegate knows which host is orchestrating. Idempotent.
+ */
+export async function registerMcp(runtime: SystemRuntime, hosts: readonly ShellHost[]): Promise<string[]> {
+  const notes: string[] = []
+  const [node, entry] = entryCommand() as [string, string]
+  for (const host of hosts) {
+    const bin = runtime.locateBinary(host === 'claude' ? 'claude' : 'agy')
+    if (!bin) {
+      notes.push(`${host}: no instalado, se omite el MCP`)
+      continue
+    }
+    const callerEnv = `${CALLER_ENV}=${host}`
+    if (host === 'claude') {
+      await runtime.execProcess(bin, ['mcp', 'remove', '-s', 'user', 'sebshell']).catch(() => undefined)
+      const res = await runtime.execProcess(bin, ['mcp', 'add', '-s', 'user', '-e', callerEnv, 'sebshell', '--', node, entry, 'mcp'])
+      notes.push(res.exitCode === 0 ? 'claude: MCP sebshell registrado' : `claude: fallo al registrar MCP (${res.stderr.trim().slice(0, 160)})`)
+    } else {
+      const res = await runtime.execProcess(bin, ['mcp', 'add', '--env', callerEnv, 'sebshell', node, entry, 'mcp'])
+      notes.push(res.exitCode === 0 ? 'agy: MCP sebshell registrado' : `agy: fallo al registrar MCP (${res.stderr.trim().slice(0, 160)})`)
+    }
+  }
+  return notes
+}
+
+function makeCrew(runtime: SystemRuntime): CrewClient {
+  return new CrewClient({ locate: (b) => runtime.locateBinary(b), exec: (b, a) => runtime.execProcess(b, a, { timeoutMs: 120_000 }) })
+}
+
+async function editCrewInteractive(runtime: SystemRuntime, config: ShellConfig): Promise<void> {
+  const color = colorEnabled()
+  const theme = getTheme(config.theme)
+  const header = renderBanner({ theme, color, columns: process.stdout.columns ?? 80, subtitle: 'Tripulación: host, modelo y esfuerzo por subagente\n' })
+  const io = { input: process.stdin, output: process.stdout }
+  await runCrewEditor(
+    (q) => runMenu(io, 'single', q.options, q.initial, { title: q.title, theme, color, header }),
+    makeCrew(runtime),
+    async (lines) => {
+      await runMenu(io, 'single', [{ value: 'ok', label: 'Continuar' }], ['ok'], { title: lines.map((l) => `⚠ ${l}`).join('\n'), theme, color, header })
+    },
+  )
+  process.stdout.write('\x1b[2J\x1b[H')
+}
+
 async function install(runtime: SystemRuntime, config: ShellConfig, dryRun: boolean, quiet = false): Promise<StepReport[]> {
   const color = colorEnabled()
   const reports = await runInstall(makeDeps(runtime), {
@@ -86,6 +138,7 @@ async function install(runtime: SystemRuntime, config: ShellConfig, dryRun: bool
   })
   if (!dryRun) {
     if (reports.every((r) => r.status !== 'failed')) await registerNode(runtime)
+    for (const note of await registerMcp(runtime, config.hosts)) if (!quiet) process.stdout.write(`  ${note}\n`)
     // Profiles share ~/.claude assets via symlinks; sync picks up MCP servers that setup just added.
     try {
       for (const r of await syncProfiles(runtime)) for (const w of r.report.warnings) process.stderr.write(`⚠ ${r.profile.name}: ${w}\n`)
@@ -126,6 +179,10 @@ async function interactiveWizard(runtime: SystemRuntime, current: ShellConfig | 
     const failed = reports.filter((r) => r.status === 'failed')
     process.stdout.write(failed.length === 0 ? 'Ecosistema listo.\n' : `${failed.length} paso(s) fallaron; revisa arriba.\n`)
   }
+  if (outcome.editCrew) {
+    if (runtime.locateBinary('crewseb')) await editCrewInteractive(runtime, outcome.config)
+    else process.stdout.write('crewseb no está instalado; el editor de la tripulación queda para después de instalarlo.\n')
+  }
   return outcome.config
 }
 
@@ -147,6 +204,8 @@ Uso:
   sebshell run --host claude|agy [--agent <rol>] [--profile <nombre>] "<prompt>"
   sebshell profile <list|add|login|use|rm|sync>   Cuentas por host (ver: sebshell profile help)
   sebshell doctor [--json]         Estado de hosts, nodos hubseb y configuración
+  sebshell crew                    Editor de host, modelo y esfuerzo por subagente (crewseb)
+  sebshell mcp                     Servidor MCP (seb_delegate, seb_routing) para Claude y agy
   sebshell capabilities [--json]
 `
 
@@ -199,6 +258,25 @@ export async function main(argv: string[]): Promise<number> {
     return failed ? 1 : 0
   }
 
+  if (action === 'mcp') {
+    const deps = makeDeps(runtime)
+    const crew = makeCrew(runtime)
+    await serveMcp(
+      {
+        crew,
+        dispatch: deps,
+        profileEnv: async (host) => profileEnv(await resolveProfile(runtime, host)),
+        permission: async () => ((await loadConfig(runtime)) ?? defaultConfig()).delegatePermission,
+        env: process.env,
+        cwd: process.cwd(),
+      },
+      VERSION,
+      process.stdin,
+      process.stdout,
+    )
+    return 0
+  }
+
   if (action === 'profile' || action === 'profiles') {
     const sub = args.slice(1)
     if (sub[0] === 'help' || sub[0] === '--help') {
@@ -210,9 +288,14 @@ export async function main(argv: string[]): Promise<number> {
 
   if (action === 'run') {
     const rest = args.slice(1)
-    const hostArg = readFlag(rest, '--host') ?? config?.orchestrator ?? 'claude'
+    const explicitHost = readFlag(rest, '--host')
     const agent = readFlag(rest, '--agent') ?? null
     const profileName = readFlag(rest, '--profile') ?? null
+    // An explicit --host wins; otherwise a routed crewseb role runs on its routed host.
+    const crew = makeCrew(runtime)
+    const info = agent && isCrewRole(agent) && crew.available ? await crew.role(agent).catch(() => undefined) : undefined
+    const fallbackHost = parseHost(config?.orchestrator ?? 'claude') ?? 'claude'
+    const hostArg = explicitHost ?? hostFor(info, fallbackHost)
     const host = parseHost(hostArg)
     const prompt = rest.join(' ').trim()
     if (!host || !prompt) {
@@ -228,16 +311,19 @@ export async function main(argv: string[]): Promise<number> {
       process.stderr.write(jsonMode ? serializeWire(wireFailure('run', 'profile_error', msg)) : `${msg}\n`)
       return 2
     }
+    const { model, effort } = invocationFor(info, host)
     const res = await runTurn(makeDeps(runtime), {
       host,
       agent,
+      model,
+      effort,
       prompt,
       env: profileEnv(profile),
       contextWindow: config?.contextWindow[host],
     })
     if (jsonMode) {
       process.stdout.write(
-        serializeWire(res.ok ? wireSuccess('run', { ...res, host, profile: profile.name }) : wireFailure('run', 'host_error', res.error ?? 'error')),
+        serializeWire(res.ok ? wireSuccess('run', { ...res, host, profile: profile.name, model, effort }) : wireFailure('run', 'host_error', res.error ?? 'error')),
       )
     } else {
       process.stdout.write(res.ok ? `${res.text.trimEnd()}\n` : '')
@@ -255,6 +341,20 @@ export async function main(argv: string[]): Promise<number> {
     }
     installTerminalRestore(process.stdin, process.stdout)
     await interactiveWizard(runtime, config)
+    return 0
+  }
+
+  if (action === 'crew') {
+    if (!interactive) {
+      process.stderr.write('sebshell crew requiere una terminal interactiva; usa "crewseb models …" en scripts.\n')
+      return 2
+    }
+    if (!runtime.locateBinary('crewseb')) {
+      process.stderr.write('crewseb no está instalado (sebshell install).\n')
+      return 1
+    }
+    installTerminalRestore(process.stdin, process.stdout)
+    await editCrewInteractive(runtime, config ?? defaultConfig())
     return 0
   }
 
@@ -288,6 +388,7 @@ export async function main(argv: string[]): Promise<number> {
         ]
       },
       reconfigure: () => interactiveWizard(runtime, effective),
+      ...(runtime.locateBinary('crewseb') ? { crew: makeCrew(runtime), editCrew: () => editCrewInteractive(runtime, effective) } : {}),
       profiles: {
         active: async (host) => activeProfileName(await loadProfiles(runtime), host),
         names: async (host) => listProfiles(await loadProfiles(runtime), host).map((p) => p.name),
