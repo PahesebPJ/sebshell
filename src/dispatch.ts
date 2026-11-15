@@ -1,6 +1,7 @@
 import type { ProcessOutcome } from 'hubseb'
 import type { ShellHost } from './config.ts'
 import type { ExecOptions } from './process.ts'
+import { mergeEnv } from './profiles.ts'
 import { type ContextSnapshot, lastJsonObject, parseAgyResult, parseClaudeResult } from './usage.ts'
 
 export interface TurnRequest {
@@ -90,7 +91,7 @@ export async function runTurn(deps: DispatchDeps, req: TurnRequest, signal?: Abo
   try {
     const outcome = await deps.exec(exe, inv.args, {
       cwd: req.cwd,
-      env: req.env ? { ...process.env, ...req.env } : undefined,
+      env: req.env ? mergeEnv(process.env, req.env) : undefined,
       input: inv.input,
       signal,
     })

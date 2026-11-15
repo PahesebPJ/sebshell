@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import type { ProcessOutcome } from 'hubseb'
+import { mergeEnv } from './profiles.ts'
 
 export interface ExecOptions {
   cwd?: string
@@ -49,7 +50,7 @@ export function execCancellable(bin: string, args: readonly string[], opts: Exec
 /** Runs a host attached to the user's terminal (e.g. `claude auth login`) and resolves with its exit code. */
 export function execInteractive(bin: string, args: readonly string[], env?: NodeJS.ProcessEnv): Promise<number> {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, [...args], { stdio: 'inherit', env: env ? { ...process.env, ...env } : process.env })
+    const child = spawn(bin, [...args], { stdio: 'inherit', env: env ? mergeEnv(process.env, env) : process.env })
     child.on('error', reject)
     child.on('close', (code) => resolve(code ?? 1))
   })

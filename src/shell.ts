@@ -95,14 +95,18 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
   const contexts: Record<string, ContextSnapshot> = {}
   let host: ShellHost = config.orchestrator
   let agent: string | null = null
+  // `:profile` overrides last for this session only; otherwise the stored active profile is
+  // re-read before every turn so a `sebshell profile use` from another terminal is honored.
+  const overrides: Partial<Record<ShellHost, string>> = {}
   const profiles: Partial<Record<ShellHost, string>> = {}
-  for (const h of config.hosts) {
-    try {
-      profiles[h] = await deps.profiles.active(h)
-    } catch {
-      profiles[h] = 'default'
-    }
+  const refreshProfile = async (h: ShellHost): Promise<string> => {
+    const name = overrides[h] ?? (await deps.profiles.active(h))
+    profiles[h] = name
+    return name
   }
+  await refreshProfile(host).catch((e: unknown) => {
+    out.write(`⚠ ${e instanceof Error ? e.message : String(e)}\n`)
+  })
   const sessionKey = () => `${host}/${profiles[host] ?? 'default'}`
 
   const profileLabel = () => {
@@ -199,6 +203,7 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         }
         out.write('\x1b[2J\x1b[H')
         printBanner()
+        await refreshProfile(host).catch(() => undefined)
         bar = new StatusBar(out, theme, io.color, { ...model(), services: await safeServices() })
         bar.attach()
       }
@@ -229,7 +234,8 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
           return
         }
         host = cmd.host
-        bar.update({ orchestrator: host, context: contexts[sessionKey()] ?? null })
+        await refreshProfile(host).catch(() => undefined)
+        bar.update({ orchestrator: host, profile: profileLabel(), context: contexts[sessionKey()] ?? null })
         return
       case 'agent':
         if (cmd.agent && !isValidAgentName(cmd.agent)) {
@@ -249,6 +255,7 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
           out.write(p.fg(theme.warn, `No existe el perfil ${host}/${cmd.name}. Créalo con: sebshell profile add ${host} ${cmd.name}\n`))
           return
         }
+        overrides[host] = cmd.name
         profiles[host] = cmd.name
         bar.update({ profile: profileLabel(), context: contexts[sessionKey()] ?? null })
         out.write(p.fg(theme.muted, `${host} ahora usa el perfil ${cmd.name} (solo en esta sesión; para fijarlo: sebshell profile use).\n`))
@@ -261,7 +268,19 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         out.write(p.fg(theme.muted, `Nueva conversación en ${host}.\n`))
         return
       case 'prompt': {
+        // Never fall back to another account: if the profile cannot be resolved, the turn is aborted.
+        let env: NodeJS.ProcessEnv
+        try {
+          const name = await refreshProfile(host)
+          env = await deps.profiles.env(host, name)
+        } catch (e) {
+          out.write(p.fg(theme.danger, `✖ Perfil no disponible: ${e instanceof Error ? e.message : String(e)}\n`))
+          bar.update({ profile: profileLabel() })
+          return
+        }
+        bar.update({ profile: profileLabel(), context: contexts[sessionKey()] ?? null })
         const label = `${host === 'antigravity' ? 'agy' : host}:${agent ?? 'main'}`
+        const turnKey = sessionKey()
         bar.update({ busy: true, activeSubagents: [label] })
         inflight = new AbortController()
         const res = await runTurn(
@@ -270,8 +289,8 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
             host,
             prompt: cmd.text,
             agent,
-            sessionId: sessions[sessionKey()] ?? null,
-            env: await deps.profiles.env(host, profiles[host] ?? 'default').catch(() => ({})),
+            sessionId: sessions[turnKey] ?? null,
+            env,
             contextWindow: config.contextWindow[host],
           },
           inflight.signal,
@@ -279,8 +298,8 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
           inflight = null
         })
         if (res.context) {
-          contexts[sessionKey()] = res.context
-          if (res.context.sessionId) sessions[sessionKey()] = res.context.sessionId
+          contexts[turnKey] = res.context
+          if (res.context.sessionId) sessions[turnKey] = res.context.sessionId
         }
         out.write(res.ok ? `${res.text.trimEnd()}\n` : p.fg(theme.danger, `✖ ${res.error}\n`))
         bar.update({ busy: false, activeSubagents: [], context: contexts[sessionKey()] ?? null })

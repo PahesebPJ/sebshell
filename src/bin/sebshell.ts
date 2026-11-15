@@ -85,9 +85,13 @@ async function install(runtime: SystemRuntime, config: ShellConfig, dryRun: bool
     onStep: quiet ? undefined : (r, i, t) => printStep(r, i, t, color, config),
   })
   if (!dryRun) {
-    // Profiles share ~/.claude assets via symlinks; sync picks up MCP servers that setup just added.
-    await syncProfiles(runtime)
     if (reports.every((r) => r.status !== 'failed')) await registerNode(runtime)
+    // Profiles share ~/.claude assets via symlinks; sync picks up MCP servers that setup just added.
+    try {
+      for (const r of await syncProfiles(runtime)) for (const w of r.report.warnings) process.stderr.write(`⚠ ${r.profile.name}: ${w}\n`)
+    } catch (e) {
+      process.stderr.write(`⚠ No se pudieron sincronizar los perfiles: ${e instanceof Error ? e.message : String(e)}\n`)
+    }
   }
   return reports
 }
@@ -232,7 +236,9 @@ export async function main(argv: string[]): Promise<number> {
       contextWindow: config?.contextWindow[host],
     })
     if (jsonMode) {
-      process.stdout.write(serializeWire(res.ok ? wireSuccess('run', res) : wireFailure('run', 'host_error', res.error ?? 'error')))
+      process.stdout.write(
+        serializeWire(res.ok ? wireSuccess('run', { ...res, host, profile: profile.name }) : wireFailure('run', 'host_error', res.error ?? 'error')),
+      )
     } else {
       process.stdout.write(res.ok ? `${res.text.trimEnd()}\n` : '')
       if (!res.ok) process.stderr.write(`${res.error}\n`)

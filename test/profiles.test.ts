@@ -5,10 +5,12 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { SystemRuntime } from 'hubseb'
-import { resolveProfile } from '../src/profile-cli.ts'
+import { maskEmail, resolveProfile } from '../src/profile-cli.ts'
 import {
   activeProfileName,
   addProfile,
+  claudeDefaultRoot,
+  mergeEnv,
   listProfiles,
   loadProfiles,
   parseClaudeAuthStatus,
@@ -47,6 +49,7 @@ describe('claude profiles', () => {
     assert.equal(dir, path.join(profilesRoot(runtime), 'claude', 'trabajo'))
     assert.equal(statSync(dir).mode & 0o777, 0o700)
     assert.deepEqual(report.linked.sort(), ['CLAUDE.md', 'agents', 'settings.json', 'skills'])
+    assert.deepEqual(report.warnings, [])
     assert.ok(lstatSync(path.join(dir, 'agents')).isSymbolicLink())
     assert.equal(readlinkSync(path.join(dir, 'CLAUDE.md')), path.join(home, '.claude', 'CLAUDE.md'))
     assert.equal(existsSync(path.join(dir, '.credentials.json')), false, 'credentials are never shared')
@@ -54,7 +57,12 @@ describe('claude profiles', () => {
     const state = JSON.parse(await readFile(path.join(dir, '.claude.json'), 'utf8'))
     assert.deepEqual(state, { mcpServers: { memoseb: { command: 'memoseb' } } }, 'only MCP servers are copied, not oauthAccount')
     assert.deepEqual(report.mcpServersAdded, ['memoseb'])
-    assert.deepEqual(profileEnv(profile), { CLAUDE_CONFIG_DIR: dir })
+    assert.deepEqual(profileEnv(profile), {
+      CLAUDE_CONFIG_DIR: dir,
+      ANTHROPIC_API_KEY: undefined,
+      ANTHROPIC_AUTH_TOKEN: undefined,
+      CLAUDE_CODE_OAUTH_TOKEN: undefined,
+    })
   })
 
   it('sync is idempotent and merges newly added MCP servers without clobbering the profile', async () => {
@@ -65,12 +73,12 @@ describe('claude profiles', () => {
     await writeFile(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: { memoseb: { command: 'memoseb' }, sebshell: { command: 'sebshell' } } }))
 
     const [first] = await syncProfiles(runtime)
-    assert.deepEqual(first?.report, { linked: [], mcpServersAdded: ['sebshell'] })
+    assert.deepEqual(first?.report, { linked: [], mcpServersAdded: ['sebshell'], warnings: [] })
     const merged = JSON.parse(await readFile(stateFile, 'utf8'))
     assert.deepEqual(merged.oauthAccount, { id: 'personal' })
     assert.deepEqual(Object.keys(merged.mcpServers).sort(), ['local', 'memoseb', 'sebshell'])
     const [second] = await syncProfiles(runtime)
-    assert.deepEqual(second?.report, { linked: [], mcpServersAdded: [] })
+    assert.deepEqual(second?.report, { linked: [], mcpServersAdded: [], warnings: [] })
   })
 
   it('switches the active profile and resolves default when none is set', async () => {
@@ -105,7 +113,7 @@ describe('claude profiles', () => {
       profilesFile(runtime),
       JSON.stringify({ schema: 'sebshell-profiles/v1', profiles: [{ host: 'claude', name: 'evil', configDir: victim, createdAt: '' }], active: {} }),
     )
-    await removeProfile(runtime, 'claude', 'evil', true)
+    await assert.rejects(removeProfile(runtime, 'claude', 'evil', true), /No existe/)
     assert.ok(existsSync(victim))
   })
 
@@ -121,10 +129,41 @@ describe('claude profiles', () => {
     await assert.rejects(resolveProfile(runtime, 'claude', 'nope'), /profile add claude nope/)
   })
 
-  it('tolerates a corrupt registry', async () => {
+  it('refuses to treat a corrupt registry as empty and keeps a copy', async () => {
     await mkdir(path.dirname(profilesFile(runtime)), { recursive: true })
     await writeFile(profilesFile(runtime), '{oops')
-    assert.deepEqual((await loadProfiles(runtime)).profiles, [])
+    await assert.rejects(loadProfiles(runtime), /corrupto/)
+    await assert.rejects(addProfile(runtime, 'claude', 'x'), /corrupto/)
+    assert.equal(await readFile(profilesFile(runtime), 'utf8'), '{oops', 'registry left untouched')
+  })
+
+  it('strips ambient credentials so they cannot override the profile login', async () => {
+    const { profile } = await addProfile(runtime, 'claude', 'aislado')
+    const merged = mergeEnv({ ANTHROPIC_API_KEY: 'sk-main', CLAUDE_CODE_OAUTH_TOKEN: 't', PATH: '/bin' }, profileEnv(profile))
+    assert.deepEqual(merged, { PATH: '/bin', CLAUDE_CONFIG_DIR: profile.configDir })
+  })
+
+  it('refuses to re-add a name whose dir (and login) survived an rm without --purge', async () => {
+    await addProfile(runtime, 'claude', 'viejo')
+    await removeProfile(runtime, 'claude', 'viejo', false)
+    await assert.rejects(addProfile(runtime, 'claude', 'viejo'), /Ya existe/)
+  })
+
+  it('ignores a CLAUDE_CONFIG_DIR that points at one of our own profiles', async () => {
+    const { profile } = await addProfile(runtime, 'claude', 'base')
+    const inside = new SystemRuntime({ homeDir: home, env: { HUBSEB_HOME: path.join(home, 'hub'), CLAUDE_CONFIG_DIR: profile.configDir as string } })
+    assert.equal(claudeDefaultRoot(inside), path.join(home, '.claude'))
+  })
+
+  it('serializes concurrent adds so none is lost', async () => {
+    await Promise.all(['c1', 'c2', 'c3', 'c4'].map((n) => addProfile(runtime, 'claude', n)))
+    assert.deepEqual((await loadProfiles(runtime)).profiles.map((p) => p.name).sort(), ['c1', 'c2', 'c3', 'c4'])
+  })
+
+  it('masks emails and strips control characters for display', () => {
+    assert.equal(maskEmail('alan@example.com', false), 'a***@example.com')
+    assert.equal(maskEmail('a\u001b[31mb@x.io', true), 'a[31mb@x.io')
+    assert.equal(maskEmail(null, false), null)
   })
 })
 

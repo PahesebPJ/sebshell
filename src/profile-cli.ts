@@ -5,7 +5,8 @@ import {
   type AccountStatus,
   activeProfileName,
   addProfile,
-  DEFAULT_PROFILE,
+  ambientClaudeCredentials,
+  mergeEnv,
   findProfile,
   listProfiles,
   loadProfiles,
@@ -20,7 +21,7 @@ import {
 } from './profiles.ts'
 
 export const PROFILE_USAGE = `Perfiles de cuenta:
-  sebshell profile list [--json]                 Perfiles por host y cuenta asociada
+  sebshell profile list [--show-email] [--json]  Perfiles por host y cuenta asociada
   sebshell profile add claude <nombre>           Crea un perfil aislado (comparte agentes/skills/hooks/MCP)
   sebshell profile login claude <nombre>         Inicia sesión en ese perfil (claude auth login)
   sebshell profile use claude <nombre|default>   Fija el perfil activo
@@ -39,7 +40,7 @@ export async function accountStatus(runtime: SystemRuntime, profile: Profile): P
   if (!exe) return null
   try {
     const res = await execCancellable(exe, ['auth', 'status', '--json'], {
-      env: { ...process.env, ...profileEnv(profile) },
+      env: mergeEnv(process.env, profileEnv(profile)),
     })
     return parseClaudeAuthStatus(res.stdout)
   } catch {
@@ -59,7 +60,18 @@ export async function resolveProfile(runtime: SystemRuntime, host: ShellHost, na
 const out = (s: string) => process.stdout.write(s)
 const err = (s: string) => process.stderr.write(s)
 
-export async function runProfileCli(runtime: SystemRuntime, args: string[], jsonMode: boolean): Promise<number> {
+/** Masks an email for display (a***@dominio) and strips control characters from untrusted text. */
+export function maskEmail(email: string | null, show: boolean): string | null {
+  if (!email) return null
+  const clean = email.replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+  if (show) return clean
+  const at = clean.indexOf('@')
+  return at > 0 ? `${clean[0]}***${clean.slice(at)}` : '***'
+}
+
+export async function runProfileCli(runtime: SystemRuntime, rawArgs: string[], jsonMode: boolean): Promise<number> {
+  const flags = new Set(rawArgs.filter((a) => a.startsWith('--')))
+  const args = rawArgs.filter((a) => !a.startsWith('--'))
   const [sub = 'list', hostArg, name] = args
   const fail = (code: string, msg: string, exit = 1) => {
     if (jsonMode) out(serializeWire(wireFailure(`profile.${sub}`, code, msg)))
@@ -70,13 +82,20 @@ export async function runProfileCli(runtime: SystemRuntime, args: string[], json
   try {
     if (sub === 'list' || sub === 'ls') {
       const store = await loadProfiles(runtime)
-      const rows: Array<Profile & { active: boolean; account: AccountStatus | null; supported: boolean }> = []
-      for (const host of SHELL_HOSTS) {
+      const showEmail = flags.has('--show-email')
+      const pending = SHELL_HOSTS.flatMap((host) => {
         const active = activeProfileName(store, host)
-        for (const p of listProfiles(store, host)) {
-          rows.push({ ...p, active: p.name === active, account: await accountStatus(runtime, p), supported: supportsProfiles(host) })
-        }
-      }
+        return listProfiles(store, host).map(async (p) => {
+          const account = await accountStatus(runtime, p)
+          return {
+            ...p,
+            active: p.name === active,
+            supported: supportsProfiles(host),
+            account: account ? { ...account, email: maskEmail(account.email, showEmail) } : null,
+          }
+        })
+      })
+      const rows = await Promise.all(pending)
       if (jsonMode) {
         out(serializeWire(wireSuccess('profile.list', { profiles: rows })))
         return 0
@@ -84,7 +103,13 @@ export async function runProfileCli(runtime: SystemRuntime, args: string[], json
       for (const host of SHELL_HOSTS) {
         out(`${host}${supportsProfiles(host) ? '' : '  (solo default por ahora)'}\n`)
         for (const r of rows.filter((x) => x.host === host)) {
-          const acct = r.account ? (r.account.loggedIn ? `${r.account.email ?? 'sesión activa'} · ${r.account.plan ?? '?'}` : 'sin sesión') : ''
+          const acct = r.account
+            ? r.account.loggedIn
+              ? `${r.account.email ?? 'sesión activa'} · ${r.account.plan ?? '?'}`
+              : 'sin sesión'
+            : r.host === 'claude'
+              ? 'estado desconocido'
+              : ''
           out(`  ${r.active ? '●' : '○'} ${r.name.padEnd(16)} ${acct}\n`)
         }
       }
@@ -95,7 +120,11 @@ export async function runProfileCli(runtime: SystemRuntime, args: string[], json
       const results = await syncProfiles(runtime)
       if (jsonMode) out(serializeWire(wireSuccess('profile.sync', { results })))
       else if (results.length === 0) out('No hay perfiles adicionales que sincronizar.\n')
-      else for (const r of results) out(`${r.profile.host}/${r.profile.name}: enlazados [${r.report.linked.join(', ') || '—'}] · MCP nuevos [${r.report.mcpServersAdded.join(', ') || '—'}]\n`)
+      else
+        for (const r of results) {
+          out(`${r.profile.host}/${r.profile.name}: enlazados [${r.report.linked.join(', ') || '—'}] · MCP nuevos [${r.report.mcpServersAdded.join(', ') || '—'}]\n`)
+          for (const w of r.report.warnings) err(`  ⚠ ${w}\n`)
+        }
       return 0
     }
 
@@ -109,6 +138,11 @@ export async function runProfileCli(runtime: SystemRuntime, args: string[], json
       else {
         out(`Perfil ${host}/${name} creado en ${profile.configDir}\n`)
         out(`  compartido: ${report.linked.join(', ') || '—'}\n  MCP copiados: ${report.mcpServersAdded.join(', ') || '—'}\n`)
+        for (const w of report.warnings) err(`  ⚠ ${w}\n`)
+        const ambient = ambientClaudeCredentials(process.env)
+        if (ambient.length > 0) {
+          err(`  ⚠ Tu entorno define ${ambient.join(', ')}; sebshell las quita al usar este perfil, pero un "claude" lanzado a mano las usaría.\n`)
+        }
         out(`Siguiente paso: sebshell profile login ${host} ${name}\n`)
       }
       return 0
@@ -116,7 +150,9 @@ export async function runProfileCli(runtime: SystemRuntime, args: string[], json
 
     if (sub === 'login') {
       if (!process.stdin.isTTY) return fail('not_tty', 'El login requiere una terminal interactiva.', 2)
-      const profile = await resolveProfile(runtime, host, name ?? DEFAULT_PROFILE)
+      // The name is mandatory so a typo can never re-login the main account by accident.
+      if (!name) return fail('bad_args', `Indica el perfil: sebshell profile login ${host} <nombre> (usa "default" para la cuenta principal).`, 2)
+      const profile = await resolveProfile(runtime, host, name)
       const exe = runtime.locateBinary('claude')
       if (host !== 'claude' || !exe) return fail('unsupported', `Login no disponible para ${host}.`)
       out(`Iniciando sesión en ${host}/${profile.name}. Usa la cuenta que quieras asociar a este perfil.\n`)
@@ -136,7 +172,7 @@ export async function runProfileCli(runtime: SystemRuntime, args: string[], json
 
     if (sub === 'rm' || sub === 'remove') {
       if (!name) return fail('bad_args', `Falta el nombre.\n${PROFILE_USAGE}`, 2)
-      const purge = args.includes('--purge')
+      const purge = flags.has('--purge')
       const profile = await removeProfile(runtime, host, name, purge)
       if (jsonMode) out(serializeWire(wireSuccess('profile.rm', { profile, purged: purge })))
       else out(purge ? `Perfil ${host}/${name} eliminado junto con su sesión.\n` : `Perfil ${host}/${name} quitado; su carpeta sigue en ${profile.configDir}\n`)
