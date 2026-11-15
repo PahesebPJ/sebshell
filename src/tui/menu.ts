@@ -167,21 +167,34 @@ export function runMenu<T extends string>(
       output.write(`${ansi.clearScreen}${ansi.hideCursor}${render.header ?? ''}${renderMenu(state, render)}`)
     }
 
-    const onKey = (_: string, key: Key | undefined) => {
-      state = reduceMenu(state, key ?? {})
-      if (state.outcome === 'pending') {
-        draw()
-        return
-      }
+    const cleanup = () => {
       input.off('keypress', onKey)
       if (input.isTTY) input.setRawMode(Boolean(wasRaw))
       input.pause()
       output.write(ansi.showCursor)
+    }
+
+    const onKey = (_: string, key: Key | undefined) => {
+      try {
+        state = reduceMenu(state, key ?? {})
+        if (state.outcome === 'pending') {
+          draw()
+          return
+        }
+      } catch {
+        state = { ...state, outcome: 'aborted' }
+      }
+      cleanup()
       if (state.outcome === 'submitted') resolve({ kind: 'submitted', values: selectedValues(state) })
       else resolve({ kind: state.outcome === 'back' ? 'back' : 'aborted' })
     }
 
     input.on('keypress', onKey)
-    draw()
+    try {
+      draw()
+    } catch {
+      cleanup()
+      resolve({ kind: 'aborted' })
+    }
   })
 }

@@ -70,7 +70,7 @@ export function normalizeConfig(raw: unknown): ShellConfig {
   const contextWindow: Partial<Record<ShellHost, number>> = {}
   if (r.contextWindow && typeof r.contextWindow === 'object') {
     for (const [k, v] of Object.entries(r.contextWindow as Record<string, unknown>)) {
-      if (SHELL_HOSTS.includes(k as ShellHost) && typeof v === 'number' && v > 0) {
+      if (SHELL_HOSTS.includes(k as ShellHost) && typeof v === 'number' && Number.isFinite(v) && v > 0) {
         contextWindow[k as ShellHost] = v
       }
     }

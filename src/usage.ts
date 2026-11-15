@@ -33,14 +33,20 @@ export function parseClaudeResult(raw: unknown, fallbackWindow?: number): Contex
   const usedTokens =
     num(last.input_tokens) + num(last.cache_read_input_tokens) + num(last.cache_creation_input_tokens)
 
+  // The orchestrator is the model that consumed the most prompt tokens; subagent models
+  // (possibly with larger windows) must not inflate the denominator.
   let windowTokens = 0
   let model: string | null = null
+  let heaviest = -1
   const modelUsage = obj(r.modelUsage)
   if (modelUsage) {
     for (const [name, info] of Object.entries(modelUsage)) {
-      const w = num(obj(info)?.contextWindow)
-      if (w > windowTokens) {
-        windowTokens = w
+      const m = obj(info)
+      if (!m) continue
+      const weight = num(m.inputTokens) + num(m.cacheReadInputTokens) + num(m.cacheCreationInputTokens)
+      if (weight > heaviest) {
+        heaviest = weight
+        windowTokens = num(m.contextWindow)
         model = name
       }
     }
@@ -73,6 +79,14 @@ export function parseAgyResult(raw: unknown, fallbackWindow?: number): ContextSn
 
 /** Extracts the last parseable JSON object from (possibly NDJSON) host output. */
 export function lastJsonObject(output: string): unknown {
+  const whole = output.trim()
+  if (whole.startsWith('{')) {
+    try {
+      return JSON.parse(whole)
+    } catch {
+      // not a single document; fall back to NDJSON scanning
+    }
+  }
   const lines = output.trim().split('\n').reverse()
   for (const line of lines) {
     const t = line.trim()

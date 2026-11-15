@@ -143,9 +143,12 @@ describe('status bar', () => {
     bar.attach()
     assert.ok(writes.some((w) => w.includes('\x1b[1;29r')))
     assert.ok(writes.some((w) => w.includes('\x1b[30;1H')))
+    assert.ok(writes.some((w) => w.includes('\n\x1b[A\x1b7\x1b[1;29r')), 'frees a row before shrinking the region')
     term.rows = 40
+    writes.length = 0
     for (const l of listeners) l()
     assert.ok(writes.some((w) => w.includes('\x1b[1;39r')), 'relayout on resize')
+    assert.ok(writes.some((w) => w.includes('\x1b[30;1H\x1b[2K')), 'clears the stale bar row')
     bar.detach()
     assert.equal(listeners.size, 0)
     assert.ok(writes.at(-1)?.includes('\x1b[r'))

@@ -13,9 +13,10 @@ import {
   type ShellHost,
 } from '../config.ts'
 import { type DispatchDeps, runTurn } from '../dispatch.ts'
+import { type ExecOptions, execCancellable } from '../process.ts'
 import { type InstallerDeps, runInstall, type StepReport } from '../installer.ts'
 import { runShell } from '../shell.ts'
-import { supportsTruecolor } from '../tui/ansi.ts'
+import { installTerminalRestore, supportsTruecolor } from '../tui/ansi.ts'
 import { renderBanner } from '../tui/banner.ts'
 import { runMenu } from '../tui/menu.ts'
 import { createPainter, getTheme } from '../tui/theme.ts'
@@ -41,8 +42,7 @@ function colorEnabled(): boolean {
 function makeDeps(runtime: SystemRuntime): InstallerDeps & DispatchDeps {
   return {
     locate: (bin) => runtime.locateBinary(bin),
-    exec: (bin: string, args: readonly string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) =>
-      runtime.execProcess(bin, args, opts),
+    exec: (bin: string, args: readonly string[], opts: ExecOptions = {}) => execCancellable(bin, args, opts),
   }
 }
 
@@ -74,15 +74,15 @@ function printStep(report: StepReport, index: number, total: number, color: bool
   process.stdout.write(`${counter} ${icon} ${report.component.padEnd(19)} ${report.phase.padEnd(7)} ${p.fg(theme.muted, report.detail)}\n`)
 }
 
-async function install(runtime: SystemRuntime, config: ShellConfig, dryRun: boolean): Promise<StepReport[]> {
+async function install(runtime: SystemRuntime, config: ShellConfig, dryRun: boolean, quiet = false): Promise<StepReport[]> {
   const color = colorEnabled()
   const reports = await runInstall(makeDeps(runtime), {
     components: config.components,
     hosts: config.hosts,
     dryRun,
-    onStep: (r, i, t) => printStep(r, i, t, color, config),
+    onStep: quiet ? undefined : (r, i, t) => printStep(r, i, t, color, config),
   })
-  if (!dryRun) await registerNode(runtime)
+  if (!dryRun && reports.every((r) => r.status !== 'failed')) await registerNode(runtime)
   return reports
 }
 
@@ -123,8 +123,9 @@ function readFlag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name)
   if (i === -1) return undefined
   const value = args[i + 1]
-  args.splice(i, value === undefined ? 1 : 2)
-  return value
+  const hasValue = value !== undefined && !value.startsWith('--')
+  args.splice(i, hasValue ? 2 : 1)
+  return hasValue ? value : undefined
 }
 
 const USAGE = `sebshell v${VERSION} — shell unificada del ecosistema *seb
@@ -181,7 +182,7 @@ export async function main(argv: string[]): Promise<number> {
   if (action === 'install') {
     const effective = config ?? defaultConfig()
     const dryRun = args.includes('--dry-run')
-    const reports = await install(runtime, effective, dryRun)
+    const reports = await install(runtime, effective, dryRun, jsonMode)
     const failed = reports.some((r) => r.status === 'failed')
     if (jsonMode) process.stdout.write(serializeWire(wireSuccess('install', { reports })))
     return failed ? 1 : 0
@@ -215,6 +216,7 @@ export async function main(argv: string[]): Promise<number> {
       process.stderr.write('sebshell config requiere una terminal interactiva\n')
       return 2
     }
+    installTerminalRestore(process.stdin, process.stdout)
     await interactiveWizard(runtime, config)
     return 0
   }
@@ -229,6 +231,7 @@ export async function main(argv: string[]): Promise<number> {
     return 2
   }
 
+  installTerminalRestore(process.stdin, process.stdout)
   const effective = config ?? (await interactiveWizard(runtime, null))
   if (!effective) return 0
 

@@ -1,5 +1,5 @@
 import { contextRatio, type ContextSnapshot, formatTokens } from '../usage.ts'
-import { ansi, truncateVisible, visibleWidth } from './ansi.ts'
+import { ansi, ESC, truncateVisible, visibleWidth } from './ansi.ts'
 import { createPainter, type Rgb, type Theme } from './theme.ts'
 
 export interface StatusModel {
@@ -76,6 +76,7 @@ export class StatusBar {
   private model: StatusModel
   private readonly onResize = () => this.layout()
   private attached = false
+  private lastRows = 0
   private readonly term: Terminal
   private readonly theme: Theme
   private readonly color: boolean
@@ -102,10 +103,8 @@ export class StatusBar {
     if (!this.attached) return
     this.attached = false
     this.term.off('resize', this.onResize)
-    const rows = this.term.rows ?? 24
-    this.term.write(
-      `${ansi.saveCursor}${ansi.resetScrollRegion}${ansi.moveTo(rows)}${ansi.clearLine}${ansi.restoreCursor}`,
-    )
+    this.term.write(`${ansi.saveCursor}${ansi.resetScrollRegion}${ansi.moveTo(this.lastRows || (this.term.rows ?? 24))}${ansi.clearLine}${ansi.restoreCursor}`)
+    this.lastRows = 0
   }
 
   update(patch: Partial<StatusModel>): void {
@@ -120,8 +119,15 @@ export class StatusBar {
   private layout(): void {
     if (!this.attached) return
     const rows = this.term.rows ?? 24
-    // Scrolling the region first keeps the cursor inside it after a resize.
-    this.term.write(`${ansi.saveCursor}${ansi.scrollRegion(1, rows - 1)}${ansi.restoreCursor}`)
+    let seq = ansi.resetScrollRegion
+    if (this.lastRows > 0 && this.lastRows !== rows) {
+      seq += `${ansi.saveCursor}${ansi.moveTo(this.lastRows)}${ansi.clearLine}${ansi.restoreCursor}`
+    }
+    // "\n" + cursor-up guarantees at least one free row below the cursor (scrolling if it sat on
+    // the last row), so the cursor ends up inside the 1..rows-1 region and never over the bar.
+    seq += `\n${ESC}A${ansi.saveCursor}${ansi.scrollRegion(1, rows - 1)}${ansi.restoreCursor}`
+    this.term.write(seq)
+    this.lastRows = rows
     this.draw()
   }
 

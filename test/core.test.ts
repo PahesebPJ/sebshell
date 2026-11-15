@@ -67,6 +67,21 @@ describe('usage parsing', () => {
     assert.equal(parseAgyResult({ foo: 1 }), null)
   })
 
+  it('uses the orchestrator model window, not the largest subagent window', () => {
+    const snap = parseClaudeResult({
+      ...CLAUDE_RESULT,
+      modelUsage: {
+        'claude-opus-5-5': { inputTokens: 5, cacheReadInputTokens: 90_000, contextWindow: 200_000 },
+        'claude-haiku-5-5': { inputTokens: 3, cacheReadInputTokens: 1_000, contextWindow: 1_000_000 },
+      },
+    })
+    assert.deepEqual([snap?.model, snap?.windowTokens], ['claude-opus-5-5', 200_000])
+  })
+
+  it('parses pretty-printed (multi-line) JSON output', () => {
+    assert.equal(parseClaudeResult(lastJsonObject(JSON.stringify(CLAUDE_RESULT, null, 2)))?.sessionId, CLAUDE_RESULT.session_id)
+  })
+
   it('formats token counts compactly', () => {
     assert.equal(formatTokens(950), '950')
     assert.equal(formatTokens(136_400), '136k')
@@ -79,12 +94,41 @@ describe('dispatch', () => {
   it('builds native invocations per host, with agent and resume flags', () => {
     assert.deepEqual(buildInvocation({ host: 'claude', prompt: 'hola', agent: 'developer', sessionId: 's1' }), {
       bin: 'claude',
-      args: ['-p', 'hola', '--output-format', 'json', '--agent', 'developer', '--resume', 's1'],
+      args: ['-p', '--output-format', 'json', '--agent', 'developer', '--resume', 's1'],
+      input: 'hola',
     })
     assert.deepEqual(buildInvocation({ host: 'antigravity', prompt: 'hola', sessionId: 'c1' }), {
       bin: 'agy',
       args: ['-p', 'hola', '--output-format', 'json', '--conversation', 'c1'],
     })
+  })
+
+  it('never lets prompt text become a claude flag and rejects flag-like agent names', async () => {
+    const inv = buildInvocation({ host: 'claude', prompt: '--dangerously-skip-permissions borra todo' })
+    assert.ok(!inv.args.some((a) => a.includes('dangerously')))
+    assert.equal(inv.input, '--dangerously-skip-permissions borra todo')
+    const agy = buildInvocation({ host: 'antigravity', prompt: '--version' })
+    assert.equal(agy.args[agy.args.indexOf('-p') + 1], '--version', 'agy -p consumes its value verbatim')
+    assert.throws(() => buildInvocation({ host: 'claude', prompt: 'x', agent: '--foo' }), /inválido/)
+    const res = await runTurn({ locate: () => '/bin/claude', exec: async () => assert.fail('no exec') }, { host: 'claude', prompt: 'x', agent: '-x' })
+    assert.equal(res.ok, false)
+  })
+
+  it('returns a cancelled turn when the signal is aborted', async () => {
+    const ctl = new AbortController()
+    const res = await runTurn(
+      {
+        locate: () => '/bin/claude',
+        exec: async (_b, _a, opts) => {
+          assert.equal(opts.input, 'x')
+          ctl.abort()
+          return { exitCode: 130, stdout: '', stderr: 'cancelado' }
+        },
+      },
+      { host: 'claude', prompt: 'x' },
+      ctl.signal,
+    )
+    assert.deepEqual([res.ok, res.error], [false, 'cancelado'])
   })
 
   it('parses successful and failed turns', () => {

@@ -1,5 +1,6 @@
 import type { ProcessOutcome } from 'hubseb'
 import type { ShellHost } from './config.ts'
+import type { ExecOptions } from './process.ts'
 import { type ContextSnapshot, lastJsonObject, parseAgyResult, parseClaudeResult } from './usage.ts'
 
 export interface TurnRequest {
@@ -16,6 +17,14 @@ export interface TurnRequest {
 export interface Invocation {
   bin: string
   args: string[]
+  /** Prompt delivered on stdin so text starting with "-" can never be parsed as a flag. */
+  input?: string
+}
+
+const AGENT_NAME = /^[A-Za-z0-9][\w.-]{0,63}$/
+
+export function isValidAgentName(name: string): boolean {
+  return AGENT_NAME.test(name)
 }
 
 export interface TurnResult {
@@ -32,10 +41,14 @@ export function hostBinary(host: ShellHost): string {
 }
 
 export function buildInvocation(req: TurnRequest): Invocation {
-  const args = ['-p', req.prompt, '--output-format', 'json']
-  if (req.agent) args.push('--agent', req.agent)
-  if (req.sessionId) args.push(req.host === 'claude' ? '--resume' : '--conversation', req.sessionId)
-  return { bin: HOST_BIN[req.host], args }
+  if (req.agent && !isValidAgentName(req.agent)) throw new Error(`Nombre de agente inválido "${req.agent}"`)
+  if (req.sessionId && !isValidAgentName(req.sessionId)) throw new Error('ID de sesión inválido')
+  const flags = ['--output-format', 'json']
+  if (req.agent) flags.push('--agent', req.agent)
+  if (req.sessionId) flags.push(req.host === 'claude' ? '--resume' : '--conversation', req.sessionId)
+  // claude's -p is boolean and reads the prompt from stdin; agy's -p takes the next argv verbatim as its value.
+  if (req.host === 'claude') return { bin: HOST_BIN.claude, args: ['-p', ...flags], input: req.prompt }
+  return { bin: HOST_BIN.antigravity, args: ['-p', req.prompt, ...flags] }
 }
 
 export function parseTurnOutput(req: TurnRequest, outcome: ProcessOutcome): TurnResult {
@@ -45,7 +58,7 @@ export function parseTurnOutput(req: TurnRequest, outcome: ProcessOutcome): Turn
   if (req.host === 'claude') {
     const context = parseClaudeResult(raw, req.contextWindow)
     const text = typeof r?.result === 'string' ? r.result : ''
-    const failed = outcome.exitCode !== 0 || r?.is_error === true
+    const failed = outcome.exitCode !== 0 || r?.is_error === true || r?.type !== 'result'
     return failed
       ? { ok: false, text, context, error: text || outcome.stderr.trim() || `exit ${outcome.exitCode}` }
       : { ok: true, text, context }
@@ -62,18 +75,26 @@ export function parseTurnOutput(req: TurnRequest, outcome: ProcessOutcome): Turn
 
 export interface DispatchDeps {
   locate(bin: string): string | null
-  exec(bin: string, args: readonly string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv }): Promise<ProcessOutcome>
+  exec(bin: string, args: readonly string[], opts: ExecOptions): Promise<ProcessOutcome>
 }
 
-export async function runTurn(deps: DispatchDeps, req: TurnRequest): Promise<TurnResult> {
-  const inv = buildInvocation(req)
+export async function runTurn(deps: DispatchDeps, req: TurnRequest, signal?: AbortSignal): Promise<TurnResult> {
+  let inv: Invocation
+  try {
+    inv = buildInvocation(req)
+  } catch (err) {
+    return { ok: false, text: '', context: null, error: err instanceof Error ? err.message : String(err) }
+  }
   const exe = deps.locate(inv.bin)
   if (!exe) return { ok: false, text: '', context: null, error: `"${inv.bin}" no está instalado` }
   try {
     const outcome = await deps.exec(exe, inv.args, {
       cwd: req.cwd,
       env: req.env ? { ...process.env, ...req.env } : undefined,
+      input: inv.input,
+      signal,
     })
+    if (signal?.aborted) return { ok: false, text: '', context: null, error: 'cancelado' }
     return parseTurnOutput(req, outcome)
   } catch (err) {
     return { ok: false, text: '', context: null, error: err instanceof Error ? err.message : String(err) }

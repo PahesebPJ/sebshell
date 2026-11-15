@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline'
 import { SHELL_HOSTS, type ShellConfig, type ShellHost } from './config.ts'
-import { type DispatchDeps, runTurn } from './dispatch.ts'
+import { type DispatchDeps, isValidAgentName, runTurn } from './dispatch.ts'
 import { renderBanner } from './tui/banner.ts'
 import { StatusBar, type StatusModel } from './tui/statusbar.ts'
 import { createPainter, getTheme } from './tui/theme.ts'
@@ -107,10 +107,17 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
       }),
     )
 
+  const safeServices = async () => {
+    try {
+      return await deps.services()
+    } catch {
+      return []
+    }
+  }
+
   printBanner()
   let bar = new StatusBar(out, theme, io.color, model())
-  bar.attach()
-  bar.update({ services: await deps.services() })
+  let inflight: AbortController | null = null
 
   const promptText = () =>
     `${p.fg(theme.accent, '❯')} ${p.fg(theme.muted, host === 'antigravity' ? 'agy' : host)}${agent ? p.fg(theme.muted, `:${agent}`) : ''} `
@@ -118,8 +125,24 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
   // Readline is recreated after :config because the wizard needs exclusive raw keypress access.
   let running = true
   try {
+    bar.attach()
+    bar.update({ services: await safeServices() })
     while (running) {
       const rl = createInterface({ input: io.input, output: out, terminal: Boolean(io.input.isTTY) })
+      let closed = false
+      rl.on('close', () => {
+        closed = true
+        inflight?.abort()
+      })
+      // Ctrl+C cancels the running turn; on an idle prompt it exits the shell.
+      rl.on('SIGINT', () => {
+        if (inflight) {
+          inflight.abort()
+          return
+        }
+        running = false
+        rl.close()
+      })
       let reconfigure = false
       rl.setPrompt(promptText())
       rl.prompt()
@@ -134,6 +157,7 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
           break
         }
         await handle(cmd)
+        if (closed) break
         rl.setPrompt(promptText())
         rl.prompt()
       }
@@ -150,7 +174,7 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         }
         out.write('\x1b[2J\x1b[H')
         printBanner()
-        bar = new StatusBar(out, theme, io.color, { ...model(), services: await deps.services() })
+        bar = new StatusBar(out, theme, io.color, { ...model(), services: await safeServices() })
         bar.attach()
       }
     }
@@ -183,6 +207,10 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         bar.update({ orchestrator: host, context: contexts[host] ?? null })
         return
       case 'agent':
+        if (cmd.agent && !isValidAgentName(cmd.agent)) {
+          out.write(p.fg(theme.warn, `Nombre de agente inválido "${cmd.agent}"\n`))
+          return
+        }
         agent = cmd.agent
         bar.update({ agent })
         return
@@ -195,12 +223,19 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
       case 'prompt': {
         const label = `${host === 'antigravity' ? 'agy' : host}:${agent ?? 'main'}`
         bar.update({ busy: true, activeSubagents: [label] })
-        const res = await runTurn(deps.dispatch, {
-          host,
-          prompt: cmd.text,
-          agent,
-          sessionId: sessions[host] ?? null,
-          contextWindow: config.contextWindow[host],
+        inflight = new AbortController()
+        const res = await runTurn(
+          deps.dispatch,
+          {
+            host,
+            prompt: cmd.text,
+            agent,
+            sessionId: sessions[host] ?? null,
+            contextWindow: config.contextWindow[host],
+          },
+          inflight.signal,
+        ).finally(() => {
+          inflight = null
         })
         if (res.context) {
           contexts[host] = res.context

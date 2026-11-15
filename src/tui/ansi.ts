@@ -58,3 +58,29 @@ export function supportsTruecolor(env: NodeJS.ProcessEnv): boolean {
   const ct = (env.COLORTERM ?? '').toLowerCase()
   return ct === 'truecolor' || ct === '24bit' || (env.TERM ?? '').includes('direct')
 }
+
+/** Escape sequence that undoes everything sebshell may change on the terminal. */
+export const RESTORE_TERMINAL = `${ansi.resetScrollRegion}${ansi.showCursor}${ansi.reset}`
+
+let restoreInstalled = false
+
+/** Restores cursor, scroll region and cooked mode on exit, SIGTERM and SIGHUP. Idempotent. */
+export function installTerminalRestore(input: NodeJS.ReadStream, output: NodeJS.WriteStream): void {
+  if (restoreInstalled) return
+  restoreInstalled = true
+  const restore = () => {
+    try {
+      if (input.isTTY && input.isRaw) input.setRawMode(false)
+      if (output.isTTY) output.write(RESTORE_TERMINAL)
+    } catch {
+      // terminal already gone
+    }
+  }
+  process.once('exit', restore)
+  for (const [sig, code] of [['SIGTERM', 143], ['SIGHUP', 129]] as const) {
+    process.once(sig, () => {
+      restore()
+      process.exit(code)
+    })
+  }
+}
