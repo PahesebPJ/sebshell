@@ -16,7 +16,7 @@ import { type DispatchDeps, runTurn } from '../dispatch.ts'
 import { type ExecOptions, execCancellable } from '../process.ts'
 import { type InstallerDeps, runInstall, type StepReport } from '../installer.ts'
 import { PROFILE_USAGE, parseHost, resolveProfile, runProfileCli } from '../profile-cli.ts'
-import { activeProfileName, listProfiles, loadProfiles, type Profile, profileEnv, syncProfiles } from '../profiles.ts'
+import { activeProfileName, CLAUDE_AUTH_OVERRIDES, listProfiles, loadProfiles, type Profile, profileEnv, syncProfiles } from '../profiles.ts'
 import { runCrewEditor } from '../crew-editor.ts'
 import { CrewClient, hostFor, invocationFor, isCrewRole } from '../crew.ts'
 import { CALLER_ENV, serveMcp } from '../mcp.ts'
@@ -79,8 +79,10 @@ function printStep(report: StepReport, index: number, total: number, color: bool
   process.stdout.write(`${counter} ${icon} ${report.component.padEnd(19)} ${report.phase.padEnd(7)} ${p.fg(theme.muted, report.detail)}\n`)
 }
 
-function entryCommand(): string[] {
-  return [process.execPath, realpathSync(fileURLToPath(import.meta.url))]
+/** Prefer the stable `sebshell` on PATH over this checkout's path (which may be a worktree). */
+function entryCommand(runtime: SystemRuntime): string[] {
+  const onPath = runtime.locateBinary('sebshell')
+  return onPath ? [onPath] : [process.execPath, realpathSync(fileURLToPath(import.meta.url))]
 }
 
 /**
@@ -89,7 +91,7 @@ function entryCommand(): string[] {
  */
 export async function registerMcp(runtime: SystemRuntime, hosts: readonly ShellHost[]): Promise<string[]> {
   const notes: string[] = []
-  const [node, entry] = entryCommand() as [string, string]
+  const command = entryCommand(runtime)
   for (const host of hosts) {
     const bin = runtime.locateBinary(host === 'claude' ? 'claude' : 'agy')
     if (!bin) {
@@ -98,11 +100,17 @@ export async function registerMcp(runtime: SystemRuntime, hosts: readonly ShellH
     }
     const callerEnv = `${CALLER_ENV}=${host}`
     if (host === 'claude') {
-      await runtime.execProcess(bin, ['mcp', 'remove', '-s', 'user', 'sebshell']).catch(() => undefined)
-      const res = await runtime.execProcess(bin, ['mcp', 'add', '-s', 'user', '-e', callerEnv, 'sebshell', '--', node, entry, 'mcp'])
-      notes.push(res.exitCode === 0 ? 'claude: MCP sebshell registrado' : `claude: fallo al registrar MCP (${res.stderr.trim().slice(0, 160)})`)
+      // The name goes before -e: -e is variadic and would swallow it. Remove only to replace an
+      // existing entry, so a failed add never leaves the user without the server.
+      const addArgs = ['mcp', 'add', '-s', 'user', 'sebshell', '-e', callerEnv, '--', ...command, 'mcp']
+      let res = await runtime.execProcess(bin, addArgs)
+      if (res.exitCode !== 0 && /already exists/i.test(res.stderr + res.stdout)) {
+        await runtime.execProcess(bin, ['mcp', 'remove', '-s', 'user', 'sebshell'])
+        res = await runtime.execProcess(bin, addArgs)
+      }
+      notes.push(res.exitCode === 0 ? 'claude: MCP sebshell registrado' : `claude: fallo al registrar MCP (${(res.stderr || res.stdout).trim().slice(0, 160)})`)
     } else {
-      const res = await runtime.execProcess(bin, ['mcp', 'add', '--env', callerEnv, 'sebshell', node, entry, 'mcp'])
+      const res = await runtime.execProcess(bin, ['mcp', 'add', '--env', callerEnv, 'sebshell', ...command, 'mcp'])
       notes.push(res.exitCode === 0 ? 'agy: MCP sebshell registrado' : `agy: fallo al registrar MCP (${res.stderr.trim().slice(0, 160)})`)
     }
   }
@@ -265,8 +273,17 @@ export async function main(argv: string[]): Promise<number> {
       {
         crew,
         dispatch: deps,
-        profileEnv: async (host) => profileEnv(await resolveProfile(runtime, host)),
+        profileEnv: async (host) => {
+          // Launched by a Claude session on a specific account: delegate to Claude on that same account.
+          if (host === 'claude' && process.env.CLAUDE_CONFIG_DIR) {
+            const env: NodeJS.ProcessEnv = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR }
+            for (const k of CLAUDE_AUTH_OVERRIDES) env[k] = undefined
+            return env
+          }
+          return profileEnv(await resolveProfile(runtime, host))
+        },
         permission: async () => ((await loadConfig(runtime)) ?? defaultConfig()).delegatePermission,
+        enabledHosts: async () => ((await loadConfig(runtime)) ?? defaultConfig()).hosts,
         env: process.env,
         cwd: process.cwd(),
       },
@@ -293,11 +310,22 @@ export async function main(argv: string[]): Promise<number> {
     const profileName = readFlag(rest, '--profile') ?? null
     // An explicit --host wins; otherwise a routed crewseb role runs on its routed host.
     const crew = makeCrew(runtime)
-    const info = agent && isCrewRole(agent) && crew.available ? await crew.role(agent).catch(() => undefined) : undefined
+    let info: Awaited<ReturnType<CrewClient['role']>>
+    if (agent && isCrewRole(agent) && crew.available) {
+      info = await crew.role(agent).catch((e: unknown) => {
+        process.stderr.write(`⚠ No se pudo leer el ruteo de crewseb (${e instanceof Error ? e.message : String(e)}); se usan host y modelo por defecto.\n`)
+        return undefined
+      })
+    }
     const fallbackHost = parseHost(config?.orchestrator ?? 'claude') ?? 'claude'
     const hostArg = explicitHost ?? hostFor(info, fallbackHost)
     const host = parseHost(hostArg)
     const prompt = rest.join(' ').trim()
+    if (host && config && !config.hosts.includes(host)) {
+      const msg = `El host ${host} no está habilitado (sebshell config)`
+      process.stderr.write(jsonMode ? serializeWire(wireFailure('run', 'host_disabled', msg)) : `${msg}\n`)
+      return 2
+    }
     if (!host || !prompt) {
       const msg = !host ? `Host inválido "${hostArg}"` : 'Falta el prompt'
       process.stderr.write(jsonMode ? serializeWire(wireFailure('run', 'bad_args', msg)) : `${msg}\n${USAGE}`)

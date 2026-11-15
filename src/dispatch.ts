@@ -13,6 +13,10 @@ export interface TurnRequest {
   effort?: EffortLevel | null
   /** 'accept-edits' lets a headless turn edit files without an interactive approval prompt. */
   permission?: PermissionMode
+  /** Tools the child must not use (Claude only), e.g. the delegate tool at the last depth level. */
+  disallowedTools?: readonly string[]
+  /** Drop secret-looking variables from the inherited env (delegated turns run model-chosen tasks). */
+  scrubSecrets?: boolean
   sessionId?: string | null
   cwd?: string
   /** Extra env for the host process (e.g. CLAUDE_CONFIG_DIR of an account profile). */
@@ -40,6 +44,15 @@ export function isEffortLevel(v: unknown): v is EffortLevel {
 
 export function isValidAgentName(name: string): boolean {
   return AGENT_NAME.test(name)
+}
+
+const SECRET_KEY = /(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?|AUTH)($|_)/i
+
+/** Removes secret-looking variables (GH_TOKEN, AWS_SECRET_ACCESS_KEY, ANTHROPIC_API_KEY, …). */
+export function scrubSecretEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {}
+  for (const [k, v] of Object.entries(env)) if (!SECRET_KEY.test(k)) out[k] = v
+  return out
 }
 
 export function isValidModelName(name: string): boolean {
@@ -86,6 +99,11 @@ export function buildInvocation(req: TurnRequest): Invocation {
     if (req.model) flags.push('--model', req.model)
     if (req.effort) flags.push('--effort', req.effort)
     if (req.permission === 'accept-edits') flags.push('--permission-mode', 'acceptEdits')
+    // `=` form: the flag is variadic and would otherwise swallow the following arguments.
+    for (const tool of req.disallowedTools ?? []) {
+      if (!/^[\w.()*: -]{1,128}$/.test(tool)) throw new Error(`Herramienta inválida "${tool}"`)
+      flags.push(`--disallowedTools=${tool}`)
+    }
   } else {
     flags.push(...agyModelArgs(req.model, req.effort))
     if (req.permission === 'accept-edits') flags.push('--mode', 'accept-edits')
@@ -135,7 +153,7 @@ export async function runTurn(deps: DispatchDeps, req: TurnRequest, signal?: Abo
   try {
     const outcome = await deps.exec(exe, inv.args, {
       cwd: req.cwd,
-      env: req.env ? mergeEnv(process.env, req.env) : undefined,
+      env: req.env || req.scrubSecrets ? mergeEnv(req.scrubSecrets ? scrubSecretEnv(process.env) : process.env, req.env ?? {}) : undefined,
       input: inv.input,
       signal,
     })

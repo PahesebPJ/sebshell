@@ -286,7 +286,13 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         return
       case 'prompt': {
         // A crewseb role may be routed to another host and carry its own model/effort.
-        const info = agent && deps.crew && isCrewRole(agent) ? await deps.crew.role(agent).catch(() => undefined) : undefined
+        const info =
+          agent && deps.crew && isCrewRole(agent)
+            ? await deps.crew.role(agent).catch((e: unknown) => {
+                out.write(p.fg(theme.warn, `⚠ No se pudo leer el ruteo de crewseb (${e instanceof Error ? e.message : String(e)}); se usan host y modelo por defecto.\n`))
+                return undefined
+              })
+            : undefined
         let turnHost = hostFor(info, host)
         if (!config.hosts.includes(turnHost)) {
           out.write(p.fg(theme.warn, `${agent} está ruteado a ${turnHost}, que no está habilitado; se ejecuta en ${host}.\n`))

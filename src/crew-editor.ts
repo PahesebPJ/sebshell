@@ -88,8 +88,8 @@ async function editModel(ask: EditorAsk, crew: CrewClient, info: CrewRoleInfo, h
     tier = t
   }
 
-  if (!effort && current?.effort) await crew.setEffort(info.role, host, null)
-  return crew.setModel(info.role, host, model, effort, tier)
+  // One crewseb call (one redeploy): "none" clears a previous effort atomically with the model change.
+  return crew.setModel(info.role, host, model, effort ?? (current?.effort ? 'none' : null), tier)
 }
 
 /**

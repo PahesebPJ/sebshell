@@ -7,6 +7,8 @@ export interface ExecOptions {
   env?: NodeJS.ProcessEnv
   input?: string
   signal?: AbortSignal
+  /** Kills the child when stdout+stderr exceed this many characters (default 20M). */
+  maxOutput?: number
 }
 
 /** Like hubseb's execProcess, plus AbortSignal support so Ctrl+C can stop an in-flight host turn. */
@@ -31,15 +33,27 @@ export function execCancellable(bin: string, args: readonly string[], opts: Exec
       setTimeout(() => child.exitCode === null && child.kill('SIGKILL'), 2000).unref()
     }
     opts.signal?.addEventListener('abort', onAbort, { once: true })
-    child.stdout.setEncoding('utf8').on('data', (c: string) => (stdout += c))
-    child.stderr.setEncoding('utf8').on('data', (c: string) => (stderr += c))
+    const cap = opts.maxOutput ?? 20_000_000
+    let overflow = false
+    const collect = (append: (c: string) => void) => (c: string) => {
+      if (overflow) return
+      append(c)
+      if (stdout.length + stderr.length > cap) {
+        overflow = true
+        child.kill('SIGTERM')
+      }
+    }
+    child.stdout.setEncoding('utf8').on('data', collect((c) => (stdout += c)))
+    child.stderr.setEncoding('utf8').on('data', collect((c) => (stderr += c)))
     child.on('error', (err) => {
       opts.signal?.removeEventListener('abort', onAbort)
       reject(err)
     })
     child.on('close', (code) => {
       opts.signal?.removeEventListener('abort', onAbort)
-      resolve(aborted ? { exitCode: 130, stdout, stderr: 'cancelado' } : { exitCode: code ?? 1, stdout, stderr })
+      if (aborted) resolve({ exitCode: 130, stdout, stderr: 'cancelado' })
+      else if (overflow) resolve({ exitCode: 1, stdout: '', stderr: `salida demasiado grande (> ${cap} caracteres)` })
+      else resolve({ exitCode: code ?? 1, stdout, stderr })
     })
     child.stdin.on('error', () => undefined)
     if (opts.input !== undefined) child.stdin.write(opts.input)

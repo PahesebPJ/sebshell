@@ -53,7 +53,7 @@ export class CrewError extends Error {}
 
 /** What sebshell must pass at invocation so the role runs with its configured model/effort. */
 export function invocationFor(info: CrewRoleInfo | undefined, host: ShellHost): { model: string | null; effort: EffortLevel | null } {
-  const entry = info?.hosts[host]
+  const entry = info?.hosts?.[host]
   // Claude's frontmatter already carries model + effort; agy's can only carry a tier.
   if (!entry || entry.appliedAt !== 'invocation') return { model: null, effort: null }
   return {
@@ -104,7 +104,9 @@ export class CrewClient {
   async roles(force = false): Promise<CrewRoleInfo[]> {
     if (!force && this.cache && Date.now() - this.cache.at < 5000) return this.cache.roles
     const { roles } = await this.call<{ roles: CrewRoleInfo[] }>(['models', 'resolve'])
-    const valid = roles.filter((r) => isCrewRole(r.role))
+    const valid = (Array.isArray(roles) ? roles : []).filter(
+      (r): r is CrewRoleInfo => Boolean(r) && typeof r === 'object' && isCrewRole(r.role) && Boolean(r.hosts) && typeof r.hosts === 'object',
+    )
     this.cache = { at: Date.now(), roles: valid }
     return valid
   }
@@ -126,7 +128,7 @@ export class CrewClient {
     return Array.isArray(out.warnings) ? out.warnings : []
   }
 
-  setModel(role: CrewRole, host: ShellHost, model: string, effort: EffortLevel | null, tier: string | null): Promise<string[]> {
+  setModel(role: CrewRole, host: ShellHost, model: string, effort: EffortLevel | 'none' | null, tier: string | null): Promise<string[]> {
     const args = ['models', 'set', role, model, '--host', host]
     if (effort) args.push('--effort', effort)
     if (tier) args.push('--tier', tier)
