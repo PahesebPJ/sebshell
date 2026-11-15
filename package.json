@@ -1,0 +1,41 @@
+{
+  "name": "sebshell",
+  "version": "0.1.0",
+  "description": "Unified installer, mixed-host agent shell and account profiles for the *seb ecosystem (Claude Code + Antigravity CLI).",
+  "license": "MIT",
+  "author": "PahesebPJ",
+  "homepage": "https://github.com/PahesebPJ/sebshell#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PahesebPJ/sebshell.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "sebshell": "./dist/bin/sebshell.js",
+    "seb": "./dist/bin/sebshell.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node -e \"fs.chmodSync('dist/bin/sebshell.js', 0o755)\"",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "sebshell": "node src/bin/sebshell.ts"
+  },
+  "dependencies": {
+    "hubseb": "^0.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.2"
+  }
+}
