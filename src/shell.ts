@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline'
+import { newSessionId, SESSION_ENV } from './activity.ts'
 import { SHELL_HOSTS, type ShellConfig, type ShellHost } from './config.ts'
 import { type CrewClient, hostFor, invocationFor, isCrewRole } from './crew.ts'
 import { type DispatchDeps, isValidAgentName, runTurn } from './dispatch.ts'
@@ -20,6 +21,8 @@ export interface ShellServices {
   /** crewseb integration (routing + per-role model/effort); absent when crewseb is not installed. */
   crew?: CrewClient
   editCrew?(): Promise<void>
+  /** Labels of seb_delegate turns that MCP servers of this session's host processes are running. */
+  activity?(session: string): Promise<string[]>
   profiles: {
     active(host: ShellHost): Promise<string>
     names(host: ShellHost): Promise<string[]>
@@ -94,12 +97,16 @@ const HELP = [
   '  :help  ·  :exit',
 ].join('\n')
 
+const ACTIVITY_POLL_MS = 1000
+
 export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellServices, version: string): Promise<void> {
   let config = initial
   let theme = getTheme(config.theme)
   let p = createPainter(io.color)
   // Keyed by host/profile: a conversation belongs to the account that started it.
   const sessions: Record<string, string> = {}
+  // Tags every host process this shell starts so their seb_delegate turns show up in the bar.
+  const shellSession = newSessionId()
   const contexts: Record<string, ContextSnapshot> = {}
   let host: ShellHost = config.orchestrator
   let agent: string | null = null
@@ -315,6 +322,28 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
         if (turnHost !== host) out.write(p.fg(theme.muted, `↪ ${agent} se ejecuta en ${turnHost} (ruteo de crewseb)\n`))
         const turnKey = keyFor(turnHost)
         bar.update({ busy: true, activeSubagents: [label] })
+        // Delegations run by the host's own `sebshell mcp` live in other processes: poll their registry.
+        let polling = false
+        let turnActive = true
+        let shown = ''
+        const poll = deps.activity
+          ? setInterval(() => {
+              if (polling) return
+              polling = true
+              deps.activity!(shellSession)
+                .then((mcp) => {
+                  const subs = [label, ...mcp]
+                  const key = subs.join('\n')
+                  if (!turnActive || key === shown) return
+                  shown = key
+                  bar.update({ activeSubagents: subs })
+                })
+                .catch(() => {})
+                .finally(() => {
+                  polling = false
+                })
+            }, ACTIVITY_POLL_MS)
+          : null
         inflight = new AbortController()
         const res = await runTurn(
           deps.dispatch,
@@ -325,12 +354,14 @@ export async function runShell(io: ShellIO, initial: ShellConfig, deps: ShellSer
             model: turnModel,
             effort: turnEffort,
             sessionId: sessions[turnKey] ?? null,
-            env,
+            env: { ...env, [SESSION_ENV]: shellSession },
             contextWindow: config.contextWindow[turnHost],
           },
           inflight.signal,
         ).finally(() => {
           inflight = null
+          turnActive = false
+          if (poll) clearInterval(poll)
         })
         if (res.context) {
           contexts[turnKey] = res.context

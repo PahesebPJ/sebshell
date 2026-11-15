@@ -53,6 +53,8 @@ export interface McpDeps {
   cwd: string
   timeoutMs?: number
   maxConcurrent?: number
+  /** Publishes the in-flight delegation to the shell's status bar; returns its cleanup. */
+  activity?(label: string): Promise<() => Promise<void>>
 }
 
 type Json = Record<string, unknown>
@@ -159,6 +161,11 @@ export async function delegate(deps: McpDeps, args: Json, signal?: AbortSignal):
 
   const nextDepth = depth + 1
   const timeout = AbortSignal.timeout(deps.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  const label = `${host === 'antigravity' ? 'agy' : host}:${agent}${model ? ` · ${model}` : ''}${effort ? `@${effort}` : ''}`
+  // Everything that can throw runs before the record exists, so a failure never leaves a ghost in the bar.
+  const permission = await deps.permission()
+  const noop = async () => {}
+  const done = deps.activity ? await deps.activity(label).catch(() => noop) : noop
   const res = await runTurn(
     deps.dispatch,
     {
@@ -167,17 +174,17 @@ export async function delegate(deps: McpDeps, args: Json, signal?: AbortSignal):
       agent,
       model,
       effort,
-      permission: await deps.permission(),
+      permission,
       cwd: confined.cwd,
       env: { ...env, [DEPTH_ENV]: String(nextDepth), [CALLER_ENV]: host },
-      // The depth env may not survive into the child's MCP servers, so at the last level the
-      // child is also denied the delegate tool outright (claude supports this; agy relies on the env).
+      // Defense in depth at the last level: claude also gets the delegate tool denied outright. agy
+      // has no such flag, but it passes its env to its MCP servers (verified with agy, 2026-11), so
+      // the depth check above stops the chain there.
       disallowedTools: nextDepth >= MAX_DELEGATION_DEPTH ? [DELEGATE_TOOL_ID] : [],
       scrubSecrets: true,
     },
     signal ? AbortSignal.any([signal, timeout]) : timeout,
-  )
-  const label = `${host === 'antigravity' ? 'agy' : host}:${agent}${model ? ` · ${model}` : ''}${effort ? `@${effort}` : ''}`
+  ).finally(done)
   const ctx = res.context ? ` · ctx ${formatTokens(res.context.usedTokens)}/${formatTokens(res.context.windowTokens)}` : ''
   const head = notes.length > 0 ? `${notes.join('\n')}\n\n` : ''
   if (!res.ok) {

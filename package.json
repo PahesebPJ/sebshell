@@ -1,6 +1,6 @@
 {
   "name": "sebshell",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Unified installer, mixed-host agent shell and account profiles for the *seb ecosystem (Claude Code + Antigravity CLI).",
   "license": "MIT",
   "author": "PahesebPJ",
